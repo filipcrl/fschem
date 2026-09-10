@@ -1,0 +1,36 @@
+[package]
+name = "fschem"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "An egui schematic editor foundation with lossless Xschem file reading"
+license = "MIT AND GPL-2.0-or-later"
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:rfd", "dep:earcutr", "dep:image", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+
+[[bin]]
+name = "fschem"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[dependencies]
+eframe = { version = "0.33.3", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rfd = { version = "0.15", optional = true }
+earcutr = { version = "0.4", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSEvent", "NSResponder", "NSCell"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSObject", "NSString"] }
+
+[profile.release]
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
