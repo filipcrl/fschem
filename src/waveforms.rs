@@ -243,6 +243,7 @@ struct Display {
     fit: bool,
     x_range: Option<(f64, f64)>,
     group_mode: GroupMode,
+    timeline_dragging: bool,
     dirty: bool,
     traces: BTreeMap<usize, Trace>,
     projection: (usize, Mode, bool),
@@ -264,6 +265,7 @@ impl Display {
             fit: true,
             x_range: None,
             group_mode: GroupMode::Overlay,
+            timeline_dragging: false,
             dirty: true,
             traces: BTreeMap::new(),
             projection: (0, Mode::Real, false),
@@ -504,13 +506,51 @@ impl Display {
                     (min_x, max_x) = clamp_x_range(min_x - dx, max_x - dx, full_x);
                     self.x_range = Some((min_x, max_x));
                     ui.ctx().request_repaint();
-                } else if timeline_response.dragged() {
-                    let pointer_dx = ui.ctx().input(|input| input.pointer.delta().x);
-                    let dx = pointer_dx as f64 / timeline.width() as f64 * (full_x.1 - full_x.0);
-                    (min_x, max_x) = clamp_x_range(min_x + dx, max_x + dx, full_x);
+                } else if timeline_response.drag_started()
+                    && let Some(pointer) = timeline_response.interact_pointer_pos()
+                {
+                    self.timeline_dragging = true;
+                    let current_left = value_to_screen(min_x, full_x, timeline.left(), timeline.right());
+                    let current_right = value_to_screen(max_x, full_x, timeline.left(), timeline.right());
+                    if pointer.x < current_left || pointer.x > current_right {
+                        let width = max_x - min_x;
+                        let center = timeline_screen_to_value(pointer.x, timeline, full_x);
+                        (min_x, max_x) =
+                            clamp_x_range(center - width * 0.5, center + width * 0.5, full_x);
+                    }
                     self.x_range = Some((min_x, max_x));
                     ui.ctx().request_repaint();
+                } else if timeline_response.dragged() && self.timeline_dragging {
+                    if let Some(pointer) = timeline_response.interact_pointer_pos() {
+                        let width = max_x - min_x;
+                        let center = timeline_screen_to_value(pointer.x, timeline, full_x);
+                        (min_x, max_x) =
+                            clamp_x_range(center - width * 0.5, center + width * 0.5, full_x);
+                        self.x_range = Some((min_x, max_x));
+                        ui.ctx().request_repaint();
+                    }
+                } else if timeline_response.clicked()
+                    && let Some(pointer) = timeline_response.interact_pointer_pos()
+                {
+                    let current_left = value_to_screen(min_x, full_x, timeline.left(), timeline.right());
+                    let current_right = value_to_screen(max_x, full_x, timeline.left(), timeline.right());
+                    if pointer.x < current_left || pointer.x > current_right {
+                        let width = max_x - min_x;
+                        let center = full_x.0
+                            + ((pointer.x - timeline.left()) / timeline.width()).clamp(0., 1.)
+                                as f64
+                                * (full_x.1 - full_x.0);
+                        (min_x, max_x) =
+                            clamp_x_range(center - width * 0.5, center + width * 0.5, full_x);
+                        self.x_range = Some((min_x, max_x));
+                        ui.ctx().request_repaint();
+                    } else {
+                        self.x_range = Some(clamp_x_range(min_x, max_x, full_x));
+                    }
                 } else {
+                    if timeline_response.drag_stopped() {
+                        self.timeline_dragging = false;
+                    }
                     self.x_range = Some(clamp_x_range(min_x, max_x, full_x));
                 }
             }
@@ -987,10 +1027,25 @@ fn draw_x_axis(
 }
 
 fn draw_grid(painter: &egui::Painter, rect: Rect, x: (f64, f64), y: (f64, f64)) {
+    let faint_stroke = Stroke::new(1., Color32::from_gray(26));
     let stroke = Stroke::new(1., Color32::from_gray(34));
     let major_stroke = Stroke::new(1., Color32::from_gray(42));
 
     let x_step = nice_step(x.1 - x.0, (rect.width() / 90.).max(2.) as f64);
+    let x_sub_step = x_step / 5.;
+    let first_x_sub = (x.0 / x_sub_step).ceil() as i64;
+    let last_x_sub = (x.1 / x_sub_step).floor() as i64;
+    for tick in first_x_sub..=last_x_sub {
+        if tick % 5 == 0 {
+            continue;
+        }
+        let value = tick as f64 * x_sub_step;
+        let sx = value_to_screen(value, x, rect.left(), rect.right());
+        painter.line_segment(
+            [Pos2::new(sx, rect.top()), Pos2::new(sx, rect.bottom())],
+            faint_stroke,
+        );
+    }
     let first_x = (x.0 / x_step).ceil() as i64;
     let last_x = (x.1 / x_step).floor() as i64;
     for tick in first_x..=last_x {
@@ -1003,6 +1058,20 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, x: (f64, f64), y: (f64, f64)) 
     }
 
     let y_step = nice_step(y.1 - y.0, (rect.height() / 45.).max(2.) as f64);
+    let y_sub_step = y_step / 5.;
+    let first_y_sub = (y.0 / y_sub_step).ceil() as i64;
+    let last_y_sub = (y.1 / y_sub_step).floor() as i64;
+    for tick in first_y_sub..=last_y_sub {
+        if tick % 5 == 0 {
+            continue;
+        }
+        let value = tick as f64 * y_sub_step;
+        let sy = value_to_screen(value, y, rect.bottom(), rect.top());
+        painter.line_segment(
+            [Pos2::new(rect.left(), sy), Pos2::new(rect.right(), sy)],
+            faint_stroke,
+        );
+    }
     let first_y = (y.0 / y_step).ceil() as i64;
     let last_y = (y.1 / y_step).floor() as i64;
     for tick in first_y..=last_y {
@@ -1013,6 +1082,10 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, x: (f64, f64), y: (f64, f64)) 
             if tick % 5 == 0 { major_stroke } else { stroke },
         );
     }
+}
+
+fn timeline_screen_to_value(x: f32, timeline: Rect, full: (f64, f64)) -> f64 {
+    full.0 + ((x - timeline.left()) / timeline.width()).clamp(0., 1.) as f64 * (full.1 - full.0)
 }
 
 fn clamp_x_range(mut min: f64, mut max: f64, full: (f64, f64)) -> (f64, f64) {
