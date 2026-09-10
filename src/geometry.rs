@@ -141,6 +141,18 @@ impl Transform {
     }
 }
 
+/// Route new wires using only horizontal, vertical and 45-degree segments.
+pub fn wire_route(start: Point, end: Point) -> Vec<Point> {
+    let delta = end - start;
+    let diagonal = delta.x.abs().min(delta.y.abs());
+    let bend = start + Point::new(delta.x.signum() * diagonal, delta.y.signum() * diagonal);
+    if bend == start || bend == end {
+        vec![start, end]
+    } else {
+        vec![start, bend, end]
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Viewport {
     pub center: Point,

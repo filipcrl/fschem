@@ -1,8 +1,8 @@
 # fschem
 
 A cross-platform **Rust + egui** schematic editor foundation, inspired by
-Xschem. The first milestone is a **read-only viewer for Xschem `.sch` and `.sym`
-files**, with a lossless document model beneath the UI.
+Xschem. Open and edit **Xschem `.sch` and `.sym` files**, with a lossless document
+model, command-based undo/redo, SPICE export, and waveform viewing.
 
 ## Run
 
@@ -50,6 +50,10 @@ verification so far has been on macOS.
   `@name`, `@value`, `@symname`, and indexed pin attributes such as
   `@#0:pinnumber`.
 - Pan/zoom, fit, adjustable display grid, layer visibility and hidden-text view.
+- Click/Shift-click and box selection for components, wires, symbol graphics,
+  text, and pins; selected items render above other drawing content.
+- Move, copy, rotate, mirror, delete, and draw connected wires; save `.sch`/`.sym`
+  files with atomic replacement and per-document command-based undo/redo.
 - Click an instance to inspect its original properties and resolved symbol path.
 - Select an instance and press **i** to view its symbol, including embedded
   definitions. **e** opens its schematic; **Shift-E** returns one level up.
@@ -61,10 +65,136 @@ verification so far has been on macOS.
   and going up cancels an in-flight child load. The toolbar shows the stack depth.
 - Original-source preview and compatibility diagnostics. Missing/cyclic/generated
   symbols are indicated in the drawing instead of silently disappearing.
+- Export SPICE decks from the current schematic, including subcircuit hierarchy.
+- Run ngspice from the toolbar and save raw simulation data, netlist, and log.
+- Plot ngspice raw data in a separate native waveform window using `egui_plot`.
+
+### SPICE netlist export
+
+Choose **File → Export SPICE netlist…** and save a `.spice`, `.sp`, or `.cir`
+file. Export runs in the background and reports completion or errors in the UI.
+The command is available for schematics, including the built-in demonstration.
+For command-line export without opening a window:
+
+```sh
+cargo run -- --netlist target/divider.spice examples/spice.sch
+cargo run -- -L /path/to/xschem_library --netlist design.spice design.sch
+# Optional, with ngspice installed (the example's VOUT should be 2 V):
+ngspice -b target/divider.spice
+```
+
+The exporter follows Xschem's static SPICE conventions:
+
+- Symbol `format` strings and `template` defaults, with instance overrides;
+  `@name`, `@value`, `@model`, `@symname`, `@spiceprefix`, `@pinlist`, `@@PIN`,
+  and indexed pin attributes such as `@#0:net_name` and `@#0:pinnumber`.
+- Pins are layer-5 rectangle centers, in symbol record order (not `pinnumber`
+  order), with instance rotation and mirroring applied.
+- Wire endpoints, T-junctions, overlaps, and pins on wire interiors connect,
+  including diagonal segments. Crossed wire interiors alone do not connect.
+- Wire `lab` attributes and label/port symbols name nets; matching labels join
+  disconnected segments. Ground symbols with `lab=0` produce SPICE node `0`.
+  A literal `GND` label remains `GND`. Unnamed nets receive stable `net1`,
+  `net2`, … names, including floating pins.
+- Schematic `S` records and `netlist_commands` symbols supply SPICE directives;
+  `device_model` text is deduplicated. `spice_ignore`, `only_toplevel`, and
+  top-level `@savecurrent` are supported.
+- `type=subcircuit` symbols produce calls and recursively resolved `.subckt`
+  definitions. Port order comes from the symbol; schematic port labels must
+  match. Resolution honors `schematic=` using the navigation/library rules.
+  `spice_stop=true` leaves a call to an externally supplied subcircuit.
+
+This is a **static, scalar netlister**, not full Xschem/Tcl compatibility.
+Bus/vector names, Tcl-generated formats/values, `spice_short`, and hierarchical
+current-save expansion are not supported. Missing symbols/format attributes,
+conflicting net labels, duplicate device names, and hierarchy errors fail the
+export before writing a deck. Supply model includes and simulation commands in
+the schematic; the export-only command does not invoke a simulator. Source schematics and symbols
+are not modified. `examples/spice.sch` is a self-contained runnable divider.
+
+### Run ngspice and save raw data
+
+Open a schematic and click **Run ngspice…** in the toolbar. Choose a `.raw`
+destination; fschem generates the netlist and runs ngspice in the background.
+For a destination named `divider.raw`, the output files are:
+
+- `divider.raw` — ngspice raw simulation data.
+- `divider.spice` — generated SPICE deck.
+- `divider.log` — ngspice output and error messages.
+
+Install `ngspice` and make it available on the application's `PATH` (for example,
+`brew install ngspice` on macOS). The schematic must supply its analyses through
+SPICE directives such as `.op`, `.tran`, `.ac`, or `.dc`, or corresponding commands
+inside a `.control` block. For control-block analyses, the temporary run deck
+adds a raw-data write before quitting; it saves the current plot. Relative model
+and include paths are resolved from the schematic's directory.
+
+The status bar reports completion and output paths. Errors include the log path
+and the triggering diagnostics, even when they occur before the recent log tail.
+Startup OSDI preload failures are shown as non-blocking notices if ngspice exits
+successfully and produces raw data; circuit/model and analysis failures still
+fail the run. A failed simulation does not replace an existing raw
+file. Try `examples/spice.sch` for an operating-point simulation with VOUT = 2 V.
+
+### Plot raw simulation data
+
+Successful simulations automatically open their raw results in a **separate
+Waveforms window**. Click **Open raw…** in the schematic toolbar to browse an
+existing `.raw` file, or drag a raw file onto the schematic window. Ngspice does
+not need to be installed to view an existing file.
+
+In the waveform window:
+
+- Check signals in the **Signals** list; filter by name or use **All / None**.
+- Select an analysis from the plot dropdown when a file contains multiple plots.
+- Drag to pan, use the scroll wheel or pinch to zoom only the X axis around the
+  pointer, and double-click or press **Fit** to reset the
+  view, and hover over a trace for numeric coordinates.
+- Traces connect samples with straight lines. Cursor values interpolate linearly
+  between original samples in the displayed axes, including when display LOD is
+  active; gaps are never interpolated across.
+- Choose **Real**, **Imaginary**, **Magnitude**, **Magnitude (dB)**, or
+  **Phase (degrees)**. AC data defaults to magnitude versus logarithmic frequency;
+  **Log X** toggles logarithmic X scaling. dB values are relative to one unit.
+- Operating-point results use point markers and show numerical values in the
+  signal list. Signal units appear in the legend; selected signals share a Y axis.
+- Use **Reload** after another program updates the file. Closing this window
+  leaves the schematic open.
+
+Loading runs in the background. A failed load shows an error and preserves the
+previous plot. The reader supports ngspice ASCII and native-endian binary-double
+raw files, real and complex data, and concatenated plots. Binary files must use
+the current machine's byte order; LTspice-specific layouts and unpadded variable-
+length data are not supported. Files are limited to 256 MiB and 16 million total
+samples. Non-finite samples and values ineligible for logarithmic display are
+shown as gaps. On backends without native child-window support, the plot uses
+an embedded egui window instead.
+
+#### Waveform performance
+
+The waveform window repaints independently of the schematic. Trace projection
+and indexing run in the background, and toggling a previously prepared signal
+reuses its cache. The signal list renders only its visible rows.
+
+Rendering uses a viewport-aware extrema index: off-screen samples are skipped,
+and subpixel groups retain their first/last samples and minimum/maximum values.
+This preserves narrow spikes and gaps while keeping rendering work proportional
+to the window's pixel width. Zooming in restores the original samples; raw data
+is never permanently reduced. Fit bounds come from the complete traces, and
+hover/Y-only changes reuse the prepared display geometry.
+
+The reproducible synthetic benchmark (four million-sample traces, CPU frame
+preparation and tessellation) measured approximately **2,511 ms → 11.9 ms per
+frame** in a local development build, about **211× faster**. One-time indexing
+of a million-sample trace took approximately 67 ms. Results vary by hardware:
+
+```sh
+cargo test --locked --bin fschem benchmark_large_waveform_frames -- --ignored --nocapture
+```
 
 ### Controls
 
-On macOS, File, View, and Navigate use the native system menu bar. View includes
+On macOS, File, Edit, View, and Navigate use the native system menu bar. View includes
 Libraries… (Command-,), and Quit is in the standard application menu. View
 checkmarks and navigation availability follow the current document and selection.
 Other platforms use the in-window menu bar.
@@ -73,7 +203,18 @@ Other platforms use the in-window menu bar.
 | --- | --- |
 | Ctrl/Command-O | Open a schematic or symbol |
 | Ctrl/Command-R | Reload the current file and its symbol dependencies |
-| Left-click | Select an instance (empty canvas clears selection) |
+| Ctrl/Command-S | Save; documents without a path open a save dialog |
+| Ctrl/Command-Shift-S | Save As |
+| Ctrl/Command-Z | Undo |
+| Ctrl/Command-Shift-Z | Redo (also Ctrl-Y on Windows/Linux) |
+| Left-click | Select an item; repeated clicks cycle overlaps; empty space clears selection |
+| Shift-click / Shift-left-drag | Add items / enclosed items to the selection |
+| Left-drag | Box-select enclosed items |
+| G / C | Move / copy the selection; left-click places it |
+| R / X / Y | Rotate 90° / mirror across X or Y while moving or copying |
+| W | Start a wire; clicks add segments; clicking a port or existing wire finishes |
+| Esc | Cancel an unplaced move/copy or unfinished wire segment |
+| Backspace | Delete selected items |
 | Middle-button or right-button drag | Pan; left dragging does not move the view |
 | Mouse wheel / pinch | Zoom at pointer |
 | Shift-scroll | Pan with scrolling |
@@ -82,24 +223,39 @@ Other platforms use the in-window menu bar.
 | e | Descend into the selected instance's schematic |
 | Shift-E | Pop one frame from the global navigation stack |
 | Double-click component | Descend into its symbol (same as i) |
-| Backspace / Up button | Same stack pop as Shift-E |
+| Up button | Same stack pop as Shift-E |
 
-The canvas uses the default arrow pointer, including while panning. Navigation
-shortcuts are inactive while typing in a text field. Schematic descent honors
+Moves and copies snap their displacement to the grid. Rotation/mirroring uses
+the point grabbed by the cursor as its pivot. New wire routes use horizontal,
+vertical, and 45° diagonal segments, inserting a bend when necessary. Escape
+keeps already placed wire segments. The Edit menu displays available actions
+and their shortcuts; rotation and mirroring require a move/copy in progress.
+
+Each committed placement (including its rotations and mirrors), deletion, or
+wire-placement click is one undoable command. A wire click that inserts a bend
+is still one command. Selection and document text are restored together. Undo
+during a move/copy cancels the preview first; during wiring it discards the
+preview and undoes the last committed edit. Cancelled/no-op edits preserve redo;
+a new committed edit clears it. History belongs to each document/navigation
+frame and survives Save/Save As. Undo/redo never writes files automatically.
+
+Editing and navigation shortcuts are inactive while typing in a text field.
+Schematic descent honors
 an instance's `schematic=` property first, then the symbol's `schematic=`
 property; otherwise it looks for a `.sch` beside the resolved `.sym`, followed
 by the usual document/library search. Static attribute substitutions such as
 `@symname` and environment references are supported. Missing or dynamic targets
 leave the current view in place and show a diagnostic.
 
-Symbol and schematic navigation, ordinary file opens, and the Up/Backspace
-aliases all use this one stack. Reload refreshes the current view without
+Symbol and schematic navigation, ordinary file opens, and the Up button
+all use this one stack. Reload refreshes the current view without
 pushing a frame. For an embedded symbol it rebuilds the current embedded
 snapshot and its dependencies; reload its containing document to read a new
 embedded definition from disk.
 
-This milestone deliberately has no editing or schematic-save commands. It
-does not write to source schematic/symbol files.
+Changes stay in memory until Save. The status bar distinguishes modified, saved,
+and unnamed documents. Saving an embedded-symbol view uses Save As to create a
+standalone symbol file. Reload replaces the current document and its edit history.
 
 ## Symbol libraries
 
@@ -163,9 +319,11 @@ Unsupported records and malformed known records are preserved and diagnosed.
 Unterminated strings/embedded blocks produce a load error. Invalid UTF-8 is
 rejected rather than replaced with lossy characters.
 
-This is the foundation for a future span-based writer. `original()` is the
-original input, **not a serializer for edits to the parsed record view**. No
-claim of edited-file round-trip compatibility is made yet.
+Document edit methods return a new parsed document after replacing numeric spans,
+inserting records, or removing records. Untouched source text remains intact;
+copies receive unique instance/pin names. Shared embedded definitions are retained
+when deleting an instance that introduced them. `original()` returns that document's
+source text; directly mutating the typed records does not serialize those changes.
 
 ### Current interpretation limits
 
@@ -180,10 +338,9 @@ claim of edited-file round-trip compatibility is made yet.
 - Stipple/custom fill patterns are approximated; curves are tessellated and
   rendering is not pixel-identical to Xschem. Rotated/mirrored text is kept
   readable using Xschem's stroke-font layout convention.
-- Junction dots are geometric cues, not an electrical connectivity engine.
-  Interior junctions on diagonal wires are not computed yet.
-- Editing, undo, netlisting and simulation are future milestones. Symbol and
-  schematic descent are supported, but do not yet evaluate instance-specific
+- Display junction dots are geometric cues; SPICE export uses its own electrical
+  connectivity engine. Display dots on diagonal wire interiors are not computed yet.
+- Symbol and schematic descent do not yet evaluate instance-specific
   circuit parameters or Tcl-generated hierarchy views.
 - Practical loading bounds: 128 MiB per file, one million parsed records or
   scene drawing items, one million points per polygon, 64 embedded parsing
@@ -194,14 +351,20 @@ claim of edited-file round-trip compatibility is made yet.
 
 ```text
 src/document.rs     Lossless record reader, spans, properties, diagnostics
+src/edit.rs         Reversible edit commands, immutable edit states, undo/redo history
 src/geometry.rs     f64 coordinates, transforms, bounds and viewport math
 src/library.rs      File loading, ordered resolution, environment expansion, cache
 src/navigation.rs   Symbol/schematic targets and hierarchy filename resolution
+src/netlist.rs      Electrical connectivity, static SPICE formats and hierarchy export
+src/simulation.rs   Background-compatible ngspice runner, raw data and log output
+src/raw.rs          Ngspice ASCII/binary raw-file reader, real and complex samples
 src/scene.rs        Resolve documents into display geometry and inspection data
 src/stroke_font.rs  Compiled-in stroke font, decoded and cached once
 
 src/canvas.rs       egui painting, clipping, mesh preparation and display styles
 src/viewer.rs       egui application, panels, background loading and navigation
+src/waveforms.rs    Native waveform subwindow, signal selection and egui_plot charts
+src/waveform_lod.rs Peak-preserving viewport queries and multiresolution extrema index
 src/main.rs         CLI and native application entry point
 ```
 
@@ -234,6 +397,9 @@ XSCHEM_TEST_LIBRARY=../xschem/xschem_library cargo test --test compatibility ins
 # Actual desktop window, render and exit; optional screenshot artifact:
 cargo run -- --smoke-test --screenshot target/demo.png
 cargo run -- --smoke-test ../xschem/xschem_library/devices/res.sym
+
+# Optional real-ngspice raw-file compatibility test (OP, transient, AC; ASCII/binary):
+cargo test --no-default-features --lib raw::tests::reads_ngspice_operating_point_transient_and_ac_in_both_encodings -- --ignored
 ```
 
 `--check` recursively reads `.sch`/`.sym` files, reports malformed known records
@@ -254,6 +420,5 @@ without an OS window.
 
 ## Next milestone
 
-Introduce undoable document commands and a lossless writer before exposing
-editing. Keep tool state and electrical connectivity in the Rust core, and
-continue using existing Xschem projects as compatibility fixtures.
+Extend property editing and connectivity-aware tools on top of the command
+history, and continue using existing Xschem projects as compatibility fixtures.

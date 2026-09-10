@@ -1,8 +1,13 @@
 //! Xschem's record grammar, not a Tcl parser. In particular, outer braced
 //! strings end at the first *unescaped* `}`; braces are not nested. Backslash
 //! quotes the next character literally (backslash-n is not a newline).
-use crate::geometry::Point;
-use std::{fmt, ops::Range, sync::Arc};
+use crate::geometry::{Point, Transform, wire_route};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    ops::Range,
+    sync::Arc,
+};
 
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
@@ -169,10 +174,25 @@ pub enum RecordKind {
         tag: String,
     },
 }
+impl RecordKind {
+    pub fn is_editable(&self) -> bool {
+        matches!(
+            self,
+            Self::Instance { .. }
+                | Self::Wire { .. }
+                | Self::Line { .. }
+                | Self::Rectangle { .. }
+                | Self::Arc { .. }
+                | Self::Polygon { .. }
+                | Self::Text { .. }
+        )
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Document {
     source: Arc<str>,
+    scope: Range<usize>,
     pub records: Vec<Record>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -195,18 +215,406 @@ impl Document {
         let records = parser.records(false, 0)?;
         let diagnostics = parser.diagnostics;
         Ok(Self {
+            scope: 0..source.len(),
             source,
             records,
             diagnostics,
         })
     }
-    /// The compatibility contract for this read-only milestone: untouched data
+    /// The compatibility contract: untouched data
     /// round-trips byte-for-byte, including CRLF, comments and unknown records.
     pub fn original(&self) -> &str {
-        &self.source
+        &self.source[self.scope.clone()]
     }
     pub fn raw_record(&self, record: &Record) -> &str {
         &self.source[record.span.clone()]
+    }
+    /// Replace a saved file only after its complete contents have been written.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::{
+            fs,
+            io::Write,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        static NEXT_SAVE: AtomicU64 = AtomicU64::new(0);
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let (temporary, mut file) = loop {
+            let temporary = parent.join(format!(
+                ".fschem-save-{}-{}.tmp",
+                std::process::id(),
+                NEXT_SAVE.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            }
+        };
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(self.original().as_bytes())?;
+            if let Ok(metadata) = fs::metadata(path) {
+                file.set_permissions(metadata.permissions())?;
+            }
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(|error| format!("{}: {error}", path.display()))
+    }
+    /// Duplicate editable records in this document, assigning fresh instance names.
+    /// Embedded definitions remain available to their copied symbol references.
+    pub fn with_copied_records(
+        &self,
+        records: &BTreeSet<usize>,
+    ) -> Result<(Self, BTreeSet<usize>), String> {
+        let mut names: BTreeSet<_> = self
+            .records
+            .iter()
+            .filter_map(|record| match &record.kind {
+                RecordKind::Instance { properties, .. }
+                | RecordKind::Rectangle {
+                    layer: 5,
+                    properties,
+                    ..
+                } => properties.get("name").map(str::to_ascii_lowercase),
+                _ => None,
+            })
+            .collect();
+        let mut appended = String::new();
+        for &index in records {
+            let record = self
+                .records
+                .get(index)
+                .ok_or("Selected record is missing")?;
+            let mut raw = self.raw_record(record).to_owned();
+            match &record.kind {
+                RecordKind::Instance { properties, .. }
+                | RecordKind::Rectangle {
+                    layer: 5,
+                    properties,
+                    ..
+                } => {
+                    let prefix = properties
+                        .get("name")
+                        .unwrap_or(if matches!(record.kind, RecordKind::Rectangle { .. }) {
+                            "P"
+                        } else {
+                            "X"
+                        })
+                        .trim_end_matches(|c: char| c.is_ascii_digit());
+                    let prefix = if prefix.is_empty() { "X" } else { prefix };
+                    let mut number = 1;
+                    let name = loop {
+                        let name = format!("{prefix}{number}");
+                        if names.insert(name.to_ascii_lowercase()) {
+                            break name;
+                        }
+                        number += 1;
+                    };
+                    // Only the copy's property field is serialized; original bytes are untouched.
+                    let entries = std::iter::once(("name", Some(name.as_str()))).chain(
+                        properties
+                            .entries
+                            .iter()
+                            .filter(|(key, _)| key != "name")
+                            .map(|(key, value)| (key.as_str(), value.as_deref())),
+                    );
+                    let properties = entries
+                        .map(|(key, value)| match value {
+                            Some(value) => format!(
+                                "{key}=\"{}\"",
+                                value.replace('\\', "\\\\").replace('"', "\\\"")
+                            ),
+                            None => key.to_owned(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let mut parser = Parser {
+                        source: &raw,
+                        pos: 0,
+                        diagnostics: Vec::new(),
+                        line_starts: std::iter::once(0)
+                            .chain(raw.match_indices('\n').map(|(i, _)| i + 1))
+                            .collect(),
+                        record_count: 0,
+                    };
+                    parser.bump();
+                    for _ in 0..5 {
+                        parser.token().map_err(|e| e.to_string())?;
+                    }
+                    parser.whitespace();
+                    let start = parser.pos;
+                    parser.token().map_err(|e| e.to_string())?;
+                    let end = parser.pos;
+                    let escaped = properties
+                        .replace('\\', "\\\\")
+                        .replace('{', "\\{")
+                        .replace('}', "\\}");
+                    raw.replace_range(start..end, &format!("{{{escaped}}}"));
+                }
+                kind if kind.is_editable() => {}
+                _ => return Err("This record cannot be copied".into()),
+            }
+            appended.push_str(&raw);
+            if !appended.ends_with('\n') {
+                appended.push_str(self.newline());
+            }
+        }
+        let copied = (self.records.len()..self.records.len() + records.len()).collect();
+        Ok((self.with_appended_text(&appended)?, copied))
+    }
+    /// Remove selected records, retaining shared embedded definitions for surviving instances.
+    pub fn without_records(&self, records: &BTreeSet<usize>) -> Result<Self, String> {
+        if records.is_empty() {
+            return Ok(self.clone());
+        }
+        for &index in records {
+            if !self
+                .records
+                .get(index)
+                .is_some_and(|record| record.kind.is_editable())
+            {
+                return Err("This record cannot be deleted".into());
+            }
+        }
+        let mut removed = records.clone();
+        let mut relocated: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        let mut definitions = BTreeSet::new();
+        let mut owner = None;
+        for (index, record) in self.records.iter().enumerate() {
+            match &record.kind {
+                RecordKind::Instance { symbol, .. } => owner = Some((index, symbol)),
+                RecordKind::Embedded(_) => {
+                    let Some((instance, symbol)) = owner else {
+                        continue;
+                    };
+                    let first = definitions.insert(symbol);
+                    if records.contains(&instance) {
+                        removed.insert(index);
+                        if first && let Some((survivor, _)) = self.records.iter().enumerate().find(|(i, record)| {
+                            !records.contains(i) && matches!(&record.kind, RecordKind::Instance { symbol: other, .. } if other == symbol)
+                        }) {
+                            relocated.entry(survivor).or_default().push(index);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut source = String::with_capacity(self.original().len());
+        let mut cursor = self.scope.start;
+        for (index, record) in self.records.iter().enumerate() {
+            if removed.contains(&index) {
+                source.push_str(&self.source[cursor..record.span.start]);
+                cursor = record.span.end;
+            } else if let Some(definitions) = relocated.get(&index) {
+                source.push_str(&self.source[cursor..record.span.end]);
+                for &definition in definitions {
+                    if !source.ends_with('\n') {
+                        source.push_str(self.newline());
+                    }
+                    source.push_str(self.raw_record(&self.records[definition]));
+                }
+                cursor = record.span.end;
+            }
+        }
+        source.push_str(&self.source[cursor..self.scope.end]);
+        Self::parse(source).map_err(|e| e.to_string())
+    }
+    pub fn with_wire(&self, a: Point, b: Point) -> Result<Self, String> {
+        if [a.x, a.y, b.x, b.y]
+            .iter()
+            .any(|v| !v.is_finite() || v.abs() > 1e100)
+        {
+            return Err("Wire position is outside the supported range".into());
+        }
+        if a == b {
+            return Ok(self.clone());
+        }
+        let text = wire_route(a, b)
+            .windows(2)
+            .map(|segment| {
+                let [a, b] = [segment[0], segment[1]];
+                format!("N {} {} {} {} {{}}{}", a.x, a.y, b.x, b.y, self.newline())
+            })
+            .collect::<String>();
+        self.with_appended_text(&text)
+    }
+    fn newline(&self) -> &'static str {
+        if self.original().contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        }
+    }
+    fn with_appended_text(&self, text: &str) -> Result<Self, String> {
+        let mut source = self.original().to_owned();
+        if !source.is_empty() && !source.ends_with('\n') {
+            source.push_str(self.newline());
+        }
+        source.push_str(text);
+        Self::parse(source).map_err(|e| e.to_string())
+    }
+    /// Edit only an instance's numeric transform tokens, preserving all other bytes.
+    pub fn with_instance_transform(
+        &self,
+        index: usize,
+        at: Point,
+        rotation: u8,
+        flip: bool,
+    ) -> Result<Self, String> {
+        let record = self
+            .records
+            .get(index)
+            .ok_or("Instance record is missing")?;
+        if !matches!(record.kind, RecordKind::Instance { .. }) {
+            return Err("Record is not an instance".into());
+        }
+        if !at.x.is_finite() || !at.y.is_finite() || at.x.abs().max(at.y.abs()) > 1e100 {
+            return Err("Instance position is outside the supported range".into());
+        }
+        self.with_numeric_edits(vec![(
+            index,
+            vec![at.x, at.y, (rotation % 4) as f64, u8::from(flip) as f64],
+        )])
+    }
+    /// Apply a rigid group transform to schematic and symbol drawing records.
+    pub fn with_transformed_records(
+        &self,
+        records: &BTreeSet<usize>,
+        pivot: Point,
+        at: Point,
+        rotation: u8,
+        flip: bool,
+    ) -> Result<Self, String> {
+        let transform = Transform::new(at, rotation, flip);
+        let mut values = Vec::new();
+        for &index in records {
+            let record = self
+                .records
+                .get(index)
+                .ok_or("Selected record is missing")?;
+            let numbers = match &record.kind {
+                RecordKind::Instance {
+                    at: old,
+                    rotation: old_rotation,
+                    flip: old_flip,
+                    ..
+                }
+                | RecordKind::Text {
+                    at: old,
+                    rotation: old_rotation,
+                    flip: old_flip,
+                    ..
+                } => {
+                    let point = transform.point(*old - pivot);
+                    let rotation = (rotation % 4
+                        + if flip {
+                            (4 - old_rotation) % 4
+                        } else {
+                            *old_rotation
+                        })
+                        % 4;
+                    vec![
+                        point.x,
+                        point.y,
+                        rotation as f64,
+                        u8::from(flip ^ *old_flip) as f64,
+                    ]
+                }
+                RecordKind::Wire { a, b, .. }
+                | RecordKind::Line { a, b, .. }
+                | RecordKind::Rectangle { a, b, .. } => {
+                    let a = transform.point(*a - pivot);
+                    let b = transform.point(*b - pivot);
+                    vec![a.x, a.y, b.x, b.y]
+                }
+                RecordKind::Polygon { points, .. } => points
+                    .iter()
+                    .flat_map(|point| {
+                        let point = transform.point(*point - pivot);
+                        [point.x, point.y]
+                    })
+                    .collect(),
+                RecordKind::Arc {
+                    center,
+                    radius,
+                    start,
+                    sweep,
+                    ..
+                } => {
+                    let center = transform.point(*center - pivot);
+                    let start = ((if flip { 180. - start } else { *start })
+                        - (rotation % 4) as f64 * 90.)
+                        .rem_euclid(360.);
+                    vec![
+                        center.x,
+                        center.y,
+                        *radius,
+                        start,
+                        if flip { -*sweep } else { *sweep },
+                    ]
+                }
+                _ => return Err("This record cannot be moved".into()),
+            };
+            values.push((index, numbers));
+        }
+        self.with_numeric_edits(values)
+    }
+    fn with_numeric_edits(&self, values: Vec<(usize, Vec<f64>)>) -> Result<Self, String> {
+        let mut edits = Vec::new();
+        let mut parser = Parser {
+            source: &self.source,
+            pos: 0,
+            diagnostics: Vec::new(),
+            line_starts: std::iter::once(0)
+                .chain(self.source.match_indices('\n').map(|(i, _)| i + 1))
+                .collect(),
+            record_count: 0,
+        };
+        for (index, numbers) in values {
+            if numbers.iter().any(|v| !v.is_finite() || v.abs() > 1e100) {
+                return Err("Position is outside the supported range".into());
+            }
+            let record = &self.records[index];
+            parser.pos = record.span.start;
+            parser.bump(); // Record tags need not be separated from numeric fields.
+            let skip = match record.kind {
+                RecordKind::Wire { .. } => 0,
+                RecordKind::Polygon { .. } => 2,
+                _ => 1, // Symbol/text string or drawing layer.
+            };
+            for _ in 0..skip {
+                parser.token().map_err(|e| e.to_string())?;
+            }
+            for value in numbers {
+                parser.whitespace();
+                let start = parser.pos;
+                parser.token().map_err(|e| e.to_string())?;
+                edits.push((start..parser.pos, value.to_string()));
+            }
+        }
+        edits.sort_by_key(|(span, _)| span.start);
+        let mut source = String::with_capacity(self.source.len());
+        let mut cursor = 0;
+        for (span, value) in edits {
+            source.push_str(&self.source[cursor..span.start]);
+            source.push_str(&value);
+            cursor = span.end;
+        }
+        source.push_str(&self.source[cursor..]);
+        let end = self.scope.end + source.len() - self.source.len();
+        Self::parse(source[self.scope.start..end].to_owned()).map_err(|e| e.to_string())
     }
     pub fn global(&self, tag: char) -> Option<&Properties> {
         self.records
@@ -234,6 +642,8 @@ impl Document {
     pub fn embedded(&self, records: &[Record]) -> Self {
         Self {
             source: Arc::clone(&self.source),
+            scope: records.first().map_or(0, |r| r.span.start)
+                ..records.last().map_or(0, |r| r.span.end),
             records: records.to_vec(),
             diagnostics: Vec::new(),
         }
@@ -551,6 +961,209 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deleting_an_embedded_instance_preserves_the_definition_for_its_copies() {
+        let source = "# keep\r\nv {xschem file_version=1.3}\r\nC {a.sym} 0 0 0 0 {name=X1}\r\n# embedded definition\r\n[\r\nL 4 0 0 10 10 {}\r\n]\r\nC {b.sym} 0 0 0 0 {name=X2}\r\nC {a.sym} 40 0 0 0 {name=X3}\r\nN 0 0 40 0 {}\r\n";
+        let doc = Document::parse(source).unwrap();
+        let deleted = doc.without_records(&BTreeSet::from([2, 7])).unwrap();
+        assert!(deleted.diagnostics.is_empty());
+        assert!(!deleted.original().contains("name=X1"));
+        assert!(!deleted.original().contains("N 0 0"));
+        assert!(
+            deleted
+                .original()
+                .starts_with("# keep\r\nv {xschem file_version=1.3}\r\n# embedded definition\r\n")
+        );
+        let embedded_index = deleted
+            .records
+            .iter()
+            .position(|r| matches!(r.kind, RecordKind::Embedded(_)))
+            .unwrap();
+        assert!(
+            matches!(&deleted.records[embedded_index - 1].kind, RecordKind::Instance { symbol, .. } if symbol == "a.sym")
+        );
+        let all_instances = deleted
+            .records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.kind, RecordKind::Instance { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let empty = deleted.without_records(&all_instances).unwrap();
+        assert!(empty.diagnostics.is_empty());
+        assert!(
+            !empty
+                .records
+                .iter()
+                .any(|r| matches!(r.kind, RecordKind::Embedded(_)))
+        );
+        assert_eq!(doc.original(), source);
+    }
+    #[test]
+    fn symbol_primitives_transform_without_changing_metadata_or_text() {
+        let doc = Document::parse("v {xschem file_version=1.3}\nK {type=subcircuit template=\"name=X1\"}\nL 4 10 20 30 40 {dash=2}\nB 5 -2 -2 2 2 {name=P1 dir=in}\nA 4 50 60 10 30 120 {}\nP 4 3 0 0 10 0 10 20 {fill=full}\nT {label \\{x\\}} 70 80 0 0 .2 .3 {}\n").unwrap();
+        let selected = BTreeSet::from([2, 3, 4, 5, 6]);
+        for rotation in 0..4 {
+            for flip in [false, true] {
+                let transform = Transform::new(Point::new(100., 200.), rotation, flip);
+                let edited = doc
+                    .with_transformed_records(
+                        &selected,
+                        Point::default(),
+                        transform.origin,
+                        rotation,
+                        flip,
+                    )
+                    .unwrap();
+                assert!(edited.diagnostics.is_empty());
+                assert_eq!(
+                    edited.raw_record(&edited.records[1]),
+                    doc.raw_record(&doc.records[1])
+                );
+                let RecordKind::Line { a, b, .. } = edited.records[2].kind else {
+                    panic!("line expected")
+                };
+                assert_eq!(a, transform.point(Point::new(10., 20.)));
+                assert_eq!(b, transform.point(Point::new(30., 40.)));
+                let RecordKind::Polygon { points, .. } = &edited.records[5].kind else {
+                    panic!("polygon expected")
+                };
+                assert_eq!(points[2], transform.point(Point::new(10., 20.)));
+                let RecordKind::Text {
+                    text,
+                    at,
+                    rotation: r,
+                    flip: f,
+                    scale,
+                    ..
+                } = &edited.records[6].kind
+                else {
+                    panic!("text expected")
+                };
+                assert_eq!(text, "label {x}");
+                assert_eq!(*at, transform.point(Point::new(70., 80.)));
+                assert_eq!((*r, *f, *scale), (rotation, flip, Point::new(0.2, 0.3)));
+                let RecordKind::Arc {
+                    center,
+                    radius,
+                    start,
+                    sweep,
+                    ..
+                } = edited.records[4].kind
+                else {
+                    panic!("arc expected")
+                };
+                for fraction in [0., 0.5, 1.] {
+                    let angle = (30_f64 + 120. * fraction).to_radians();
+                    let expected = transform
+                        .point(Point::new(50. + 10. * angle.cos(), 60. - 10. * angle.sin()));
+                    let angle = (start + sweep * fraction).to_radians();
+                    let actual = center + Point::new(radius * angle.cos(), -radius * angle.sin());
+                    assert!((actual - expected).length() < 1e-9);
+                }
+            }
+        }
+    }
+    #[test]
+    fn copying_preserves_original_text_and_property_values_with_unique_names() {
+        let source = r#"v {xschem file_version=1.3}
+C {r.sym} 0 0 0 0 {name=R1 value="say \\"hi\\"" path="a\\\\b" custom=one custom=two flag}
+[
+L 4 0 0 20 0 {}
+]
+C {r.sym} 40 0 0 0 {name=r2}
+N0 0 40 0 {lab=signal}
+"#
+        .replace('\n', "\r\n");
+        let doc = Document::parse(source.clone()).unwrap();
+        assert!(doc.diagnostics.is_empty());
+        let (copied, indices) = doc.with_copied_records(&BTreeSet::from([1, 4])).unwrap();
+        assert_eq!(indices, BTreeSet::from([5, 6]));
+        assert!(copied.original().starts_with(&source));
+        assert_eq!(doc.original(), source);
+        let RecordKind::Instance {
+            properties: original,
+            ..
+        } = &doc.records[1].kind
+        else {
+            panic!("instance expected")
+        };
+        let RecordKind::Instance {
+            properties: clone, ..
+        } = &copied.records[5].kind
+        else {
+            panic!("instance expected")
+        };
+        assert_eq!(clone.get("name"), Some("R3"));
+        assert_eq!(
+            original
+                .entries
+                .iter()
+                .filter(|(key, _)| key != "name")
+                .collect::<Vec<_>>(),
+            clone
+                .entries
+                .iter()
+                .filter(|(key, _)| key != "name")
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            copied.raw_record(&copied.records[6]),
+            doc.raw_record(&doc.records[4])
+        );
+        let (again, _) = copied.with_copied_records(&BTreeSet::from([1])).unwrap();
+        let RecordKind::Instance { properties, .. } = &again.records[7].kind else {
+            panic!("instance expected")
+        };
+        assert_eq!(properties.get("name"), Some("R4"));
+    }
+    #[test]
+    fn adding_wire_preserves_source_and_rejects_invalid_or_zero_length_segments() {
+        let doc = Document::parse("# retained comment without a newline").unwrap();
+        let wired = doc
+            .with_wire(Point::new(1., 2.), Point::new(3., 4.))
+            .unwrap();
+        assert_eq!(
+            wired.original(),
+            "# retained comment without a newline\nN 1 2 3 4 {}\n"
+        );
+        assert_eq!(wired.records.len(), 2);
+        assert_eq!(
+            doc.with_wire(Point::default(), Point::default())
+                .unwrap()
+                .original(),
+            doc.original()
+        );
+        assert!(
+            doc.with_wire(Point::new(f64::NAN, 0.), Point::default())
+                .is_err()
+        );
+    }
+    #[test]
+    fn instance_edit_preserves_surrounding_bytes_and_embedded_scope() {
+        let source = "# keep\r\nC{odd\\}name.sym}10\t20\r\n0 0{name=X1 custom=one custom=two}\r\n[\r\nv {xschem file_version=1.3}\r\nC {child.sym} 0 0 0 0 {}\r\n]\r\nZ {future}\r\n";
+        let doc = Document::parse(source).unwrap();
+        let edited = doc
+            .with_instance_transform(1, Point::new(-40., 60.), 3, true)
+            .unwrap();
+        assert_eq!(
+            edited.original(),
+            source.replacen("10\t20\r\n0 0", "-40\t60\r\n3 1", 1)
+        );
+        assert_eq!(doc.original(), source);
+        let RecordKind::Embedded(records) = &doc.records[2].kind else {
+            panic!("embedded expected")
+        };
+        let embedded = doc.embedded(records);
+        let edited = embedded
+            .with_instance_transform(1, Point::new(20., -20.), 1, false)
+            .unwrap();
+        assert_eq!(
+            edited.original(),
+            "v {xschem file_version=1.3}\r\nC {child.sym} 20 -20 1 0 {}\r\n"
+        );
+        assert_eq!(edited.records.len(), 2);
+    }
     #[test]
     fn preserves_original_bytes_and_unknown_data() {
         let source = "\u{feff}v {xschem version=3.4.8 file_version=1.3}\r\n# { not a field\r\nF {parameters\r\nx=3}\r\nZ {future\r\nrecord} 5\r\nN 0 1 2 3 {custom=\"a b\"}\r\n  ";

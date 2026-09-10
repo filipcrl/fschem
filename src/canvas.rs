@@ -3,11 +3,11 @@ use eframe::egui::{
     epaint::{Mesh, Vertex},
 };
 use fschem::{
-    geometry::{Bounds, Point, Viewport},
-    scene::{Fill, Scene, Shape, Style},
+    geometry::{Bounds, Point, Viewport, wire_route},
+    scene::{Fill, Scene, Selection, Shape, Style},
     stroke_font::StrokeFont,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const COLORS: [Color32; 22] = [
     Color32::BLACK,
@@ -152,17 +152,25 @@ impl Canvas<'_> {
         cache: &PaintCache,
         layers: &BTreeMap<u16, bool>,
         show_hidden: bool,
-        selected: Option<usize>,
+        selected: &BTreeSet<Selection>,
     ) {
         let visible = self.world_bounds().expanded(100. / self.viewport.zoom);
-        for (index, item) in scene.items.iter().enumerate() {
+        let is_selected =
+            |item: &fschem::scene::Item| item.selection().is_some_and(|id| selected.contains(&id));
+        // Keep scene order within each group, but paint the selection on top.
+        let items = scene.items.iter().enumerate();
+        for (index, item) in items
+            .clone()
+            .filter(|(_, item)| !is_selected(item))
+            .chain(items.filter(|(_, item)| is_selected(item)))
+        {
             if (item.hidden && !show_hidden)
                 || !layers.get(&item.layer).copied().unwrap_or(true)
                 || !visible.intersects(item.bounds)
             {
                 continue;
             }
-            let color = if item.owner.is_some() && item.owner == selected {
+            let color = if is_selected(item) {
                 Color32::from_rgb(255, 185, 65)
             } else {
                 layer_color(item.layer)
@@ -217,18 +225,17 @@ impl Canvas<'_> {
                 }
             }
         }
-        if let Some(instance) = selected.and_then(|i| scene.instances.get(i)) {
-            self.painter.rect_stroke(
-                Rect::from_two_pos(
-                    self.screen(instance.bounds.min),
-                    self.screen(instance.bounds.max),
-                )
-                .expand(4.),
-                0.,
-                Stroke::new(1., Color32::from_rgb(255, 185, 65)),
-                egui::StrokeKind::Outside,
-            );
+    }
+    pub fn wire_preview(&self, a: Point, b: Point, on_connection: bool) {
+        let color = Color32::from_rgb(255, 185, 65);
+        for segment in wire_route(a, b).windows(2) {
+            self.segment(segment[0], segment[1], Stroke::new(1.5, color), 0.);
         }
+        self.painter.circle_stroke(
+            self.screen(b),
+            if on_connection { 5. } else { 3. },
+            Stroke::new(1., color),
+        );
     }
     fn segment(&self, a: Point, b: Point, stroke: Stroke, dash: f64) {
         let Some((start, end)) = clip_segment(

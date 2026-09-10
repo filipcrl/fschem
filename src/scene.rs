@@ -108,6 +108,22 @@ pub struct Item {
     pub style: Style,
     pub hidden: bool,
     pub owner: Option<usize>,
+    pub wire_record: Option<usize>,
+    pub primitive_record: Option<usize>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Selection {
+    Instance(usize),
+    Wire(usize),
+    Primitive(usize),
+}
+impl Item {
+    pub fn selection(&self) -> Option<Selection> {
+        self.owner
+            .map(Selection::Instance)
+            .or_else(|| self.wire_record.map(Selection::Wire))
+            .or_else(|| self.primitive_record.map(Selection::Primitive))
+    }
 }
 #[derive(Clone, Debug)]
 pub struct InstanceInfo {
@@ -133,6 +149,10 @@ pub struct SceneDiagnostic {
 }
 
 pub struct Scene {
+    /// Electrical pin centers in world coordinates, for interactive wire snapping.
+    pub ports: Vec<Point>,
+    /// Scene instance index to editable top-level document record index.
+    pub instance_records: BTreeMap<usize, usize>,
     pub items: Vec<Item>,
     pub instances: Vec<InstanceInfo>,
     pub bounds: Bounds,
@@ -185,6 +205,8 @@ impl LoadedDocument {
             }
         }
         let scene = Scene {
+            ports: builder.ports,
+            instance_records: builder.instance_records,
             items: builder.items,
             instances: builder.instances,
             bounds: bounds.unwrap_or(Bounds::new(
@@ -218,6 +240,8 @@ enum SymbolKey {
 }
 
 struct Builder {
+    ports: Vec<Point>,
+    instance_records: BTreeMap<usize, usize>,
     library: Library,
     items: Vec<Item>,
     instances: Vec<InstanceInfo>,
@@ -231,6 +255,8 @@ struct Builder {
 impl Builder {
     fn new(paths: LibraryPaths) -> Self {
         Self {
+            instance_records: BTreeMap::new(),
+            ports: Vec::new(),
             library: Library::new(paths),
             items: Vec::new(),
             instances: Vec::new(),
@@ -271,6 +297,8 @@ impl Builder {
                 style,
                 hidden: false,
                 owner,
+                wire_record: None,
+                primitive_record: None,
             });
         }
     }
@@ -314,7 +342,8 @@ impl Builder {
                 _ => {}
             }
         }
-        for record in &doc.records {
+        for (record_index, record) in doc.records.iter().enumerate() {
+            let first_item = self.items.len();
             if self.items.len() >= 1_000_000 {
                 return Err("scene exceeds one million drawing items".into());
             }
@@ -335,6 +364,11 @@ impl Builder {
                     let (a, b) = (transform.point(*a), transform.point(*b));
                     self.wires.push((a, b));
                     self.path(vec![a, b], false, 1, Style::new(properties, false), owner);
+                    if depth == 0
+                        && let Some(item) = self.items.last_mut()
+                    {
+                        item.wire_record = Some(record_index);
+                    }
                 }
                 RecordKind::Rectangle {
                     layer,
@@ -342,6 +376,9 @@ impl Builder {
                     b,
                     properties,
                 } => {
+                    if *layer == 5 && depth <= 1 {
+                        self.ports.push(transform.point((*a + *b) * 0.5));
+                    }
                     let bounds = Bounds::new(*a, *b);
                     let mut style = Style::new(properties, true);
                     if *layer == 2
@@ -490,6 +527,8 @@ impl Builder {
                         style: Style::new(properties, false),
                         hidden,
                         owner,
+                        wire_record: None,
+                        primitive_record: None,
                     });
                 }
                 RecordKind::Instance {
@@ -501,6 +540,9 @@ impl Builder {
                 } => {
                     let local = transform.then(Transform::new(*at, *rotation, *flip));
                     let index = self.instances.len();
+                    if depth == 0 {
+                        self.instance_records.insert(index, record_index);
+                    }
                     self.instances.push(InstanceInfo {
                         symbol: symbol.clone(),
                         resolved: None,
@@ -587,7 +629,7 @@ impl Builder {
                                 &symbol_file,
                                 local,
                                 Some(&label_context),
-                                Some(index),
+                                Some(owner.unwrap_or(index)),
                                 depth + 1,
                             )?;
                             self.active.remove(&key);
@@ -598,11 +640,11 @@ impl Builder {
                                 record.line,
                                 format!("cyclic or over-deep symbol reference {symbol:?}"),
                             );
-                            self.missing(local.origin, symbol, index);
+                            self.missing(local.origin, symbol, owner.unwrap_or(index));
                         }
                         Err(error) => {
                             self.warn(file, record.line, error);
-                            self.missing(local.origin, symbol, index);
+                            self.missing(local.origin, symbol, owner.unwrap_or(index));
                         }
                     }
                     if let Some(bounds) = self.items[before..]
@@ -618,6 +660,17 @@ impl Builder {
                     }
                 }
                 _ => {}
+            }
+            if depth == 0
+                && record.kind.is_editable()
+                && !matches!(
+                    record.kind,
+                    RecordKind::Instance { .. } | RecordKind::Wire { .. }
+                )
+            {
+                for item in &mut self.items[first_item..] {
+                    item.primitive_record = Some(record_index);
+                }
             }
         }
         Ok(())
@@ -658,6 +711,8 @@ impl Builder {
             style,
             hidden: false,
             owner: Some(owner),
+            wire_record: None,
+            primitive_record: None,
         });
     }
     fn junctions(&mut self) -> Result<(), String> {

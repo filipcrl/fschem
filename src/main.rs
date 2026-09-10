@@ -3,6 +3,8 @@ mod canvas;
 #[allow(unsafe_code)] // AppKit's Objective-C target/action bridge is isolated here.
 mod macos_menu;
 mod viewer;
+mod waveform_lod;
+mod waveforms;
 
 use fschem::{
     document::DiagnosticKind,
@@ -33,12 +35,13 @@ fn run() -> Result<(), String> {
     let mut verbose = false;
     let mut smoke_test = false;
     let mut screenshot = None;
+    let mut netlist = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--help" | "-h") => {
                 println!(
-                    "fschem [OPTIONS] [FILE.sch|FILE.sym]\n\n  -L, --library DIR  Add a symbol library search path (repeatable)\n  --check PATH...   Check file syntax and lossless retention; recurse through directories\n  --verbose        Show all parser diagnostics in check mode\n  --smoke-test     Open, render three frames, then exit (demo if no file given)\n  --screenshot PNG Capture the egui window after loading\n\nCtrl/Command-O opens a file. Left-click selects; middle/right-drag pans.\nWheel/pinch zooms; F fits. i: symbol, e: schematic, Shift-E: up one level.\nThe stroke font is built in. No schematic files are modified by this read-only milestone."
+                    "fschem [OPTIONS] [FILE.sch|FILE.sym]\n\n  -L, --library DIR  Add a symbol library search path (repeatable)\n  --netlist OUTPUT  Export FILE.sch as a SPICE deck without opening a window\n  --check PATH...   Check file syntax and lossless retention; recurse through directories\n  --verbose        Show all parser diagnostics in check mode\n  --smoke-test     Open, render three frames, then exit (demo if no file given)\n  --screenshot PNG Capture the egui window after loading\n\nCtrl/Command-O opens; Ctrl/Command-S saves; Ctrl/Command-Z undoes; Ctrl/Command-Shift-Z redoes.\nClick/Shift-click or left-drag selects; G moves; C copies; W wires; Backspace deletes.\nR/X/Y rotate or mirror while moving; left-click places; Esc cancels.\nMiddle/right-drag pans; wheel/pinch zooms; F fits. i: symbol, e: schematic, Shift-E: up.\nFile → Export SPICE netlist exports the current schematic.\nThe stroke font is built in. Source schematic files change only when saved."
                 );
                 return Ok(());
             }
@@ -46,6 +49,11 @@ fn run() -> Result<(), String> {
                 args.next().ok_or("--library requires a directory")?,
             )),
             Some("--check") => check = true,
+            Some("--netlist") => {
+                netlist = Some(PathBuf::from(
+                    args.next().ok_or("--netlist requires an output path")?,
+                ));
+            }
             Some("--verbose") => verbose = true,
             Some("--smoke-test") => smoke_test = true,
             Some("--screenshot") => {
@@ -63,6 +71,20 @@ fn run() -> Result<(), String> {
             }
             _ => inputs.push(PathBuf::from(arg)),
         }
+    }
+    if let Some(output) = netlist {
+        if check || smoke_test || screenshot.is_some() || inputs.len() != 1 {
+            return Err("--netlist OUTPUT requires one input schematic and cannot be combined with --check, --smoke-test or --screenshot".into());
+        }
+        let input = std::fs::canonicalize(&inputs[0]).map_err(|e| e.to_string())?;
+        if std::fs::canonicalize(&output).ok().as_ref() == Some(&input) {
+            return Err("netlist output must differ from the source schematic".into());
+        }
+        let doc = read_document(&input)?;
+        let deck = fschem::netlist::spice(&doc, &input, LibraryPaths::discover(roots))?;
+        fschem::netlist::write_spice(&output, &deck)?;
+        println!("Exported SPICE netlist to {}", output.display());
+        return Ok(());
     }
     if check {
         if inputs.is_empty() {

@@ -8,15 +8,22 @@ use objc2_foundation::{MainThreadMarker, NSObject, NSString};
 
 #[derive(Clone, Copy)]
 pub enum Command {
+    Undo,
+    Redo,
+    Edit(egui::Key),
     Open,
+    Save,
+    SaveAs,
     Demo,
     Reload,
+    ExportSpice,
     Fit,
     Grid,
     Hidden,
     Source,
     Diagnostics,
     Libraries,
+    Fps,
     Symbol,
     Schematic,
     Back,
@@ -50,6 +57,20 @@ define_class!(
                 9 => Command::Symbol,
                 10 => Command::Schematic,
                 11 => Command::Back,
+                12 => Command::ExportSpice,
+                13 => Command::Save,
+                14 => Command::SaveAs,
+                15 => Command::Fps,
+                100 => Command::Edit(egui::Key::G),
+                101 => Command::Edit(egui::Key::C),
+                102 => Command::Edit(egui::Key::Backspace),
+                103 => Command::Edit(egui::Key::W),
+                104 => Command::Edit(egui::Key::R),
+                105 => Command::Edit(egui::Key::X),
+                106 => Command::Edit(egui::Key::Y),
+                107 => Command::Edit(egui::Key::Escape),
+                108 => Command::Undo,
+                109 => Command::Redo,
                 _ => return,
             };
             let _ = self.ivars().sender.send(command);
@@ -85,8 +106,26 @@ impl NativeMenu {
                 "File",
                 vec![
                     ("Open…", "o", 0),
+                    ("Save", "s", 13),
+                    ("Save As…", "s", 14),
                     ("Built-in demonstration", "", 1),
                     ("Reload", "r", 2),
+                    ("Export SPICE netlist…", "", 12),
+                ],
+            ),
+            (
+                "Edit",
+                vec![
+                    ("Undo", "z", 108),
+                    ("Redo", "z", 109),
+                    ("Move (G)", "", 100),
+                    ("Copy (C)", "", 101),
+                    ("Delete (Backspace)", "", 102),
+                    ("Add wire (W)", "", 103),
+                    ("Rotate 90° (R)", "", 104),
+                    ("Mirror across X axis (X)", "", 105),
+                    ("Mirror across Y axis (Y)", "", 106),
+                    ("Cancel (Esc)", "", 107),
                 ],
             ),
             (
@@ -98,6 +137,7 @@ impl NativeMenu {
                     ("Original file text", "", 6),
                     ("Diagnostics", "", 7),
                     ("Libraries…", ",", 8),
+                    ("FPS counter", "", 15),
                 ],
             ),
             (
@@ -122,7 +162,11 @@ impl NativeMenu {
                     )
                 };
                 item.setTag(tag);
-                item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+                item.setKeyEquivalentModifierMask(if tag == 14 || tag == 109 {
+                    NSEventModifierFlags::Command | NSEventModifierFlags::Shift
+                } else {
+                    NSEventModifierFlags::Command
+                });
                 unsafe {
                     item.setTarget(Some(&handler));
                 }
@@ -136,8 +180,9 @@ impl NativeMenu {
                 &root,
                 match title {
                     "File" => 1,
-                    "View" => 2,
-                    _ => 3,
+                    "Edit" => 2,
+                    "View" => 3,
+                    _ => 4,
                 },
             );
         }
@@ -151,15 +196,50 @@ impl NativeMenu {
     pub fn commands(&self) -> Vec<Command> {
         self.receiver.try_iter().collect()
     }
+    pub fn sync_history(&self, undo: Option<&str>, redo: Option<&str>) {
+        for item in &self.items {
+            let (action, label) = match item.tag() {
+                108 => ("Undo", undo),
+                109 => ("Redo", redo),
+                _ => continue,
+            };
+            item.setEnabled(label.is_some());
+            let title =
+                label.map_or_else(|| action.to_owned(), |label| format!("{action} {label}"));
+            item.setTitle(&NSString::from_str(&title));
+        }
+    }
 
-    pub fn sync(&self, document: bool, selected: bool, back: bool, checked: [bool; 5]) {
-        self.items[2].setEnabled(document);
-        self.items[3].setEnabled(document);
-        self.items[9].setEnabled(selected);
-        self.items[10].setEnabled(selected);
-        self.items[11].setEnabled(back);
-        for (item, checked) in self.items[4..9].iter().zip(checked) {
-            item.setState(if checked { 1 } else { 0 });
+    pub fn sync(
+        &self,
+        document: bool,
+        export: bool,
+        selected: bool,
+        back: bool,
+        checked: [bool; 6],
+        edit: [bool; 4],
+    ) {
+        for item in &self.items {
+            match item.tag() {
+                2 | 3 => item.setEnabled(document),
+                12 => item.setEnabled(export),
+                13 | 14 => item.setEnabled(edit[1]),
+                100..=102 => item.setEnabled(edit[0]),
+                103 => item.setEnabled(edit[1]),
+                104..=106 => item.setEnabled(edit[2]),
+                107 => item.setEnabled(edit[3]),
+                9 | 10 => item.setEnabled(selected),
+                11 => item.setEnabled(back),
+                _ => {}
+            }
+            let checked_index = match item.tag() {
+                4..=8 => Some(item.tag() as usize - 4),
+                15 => Some(5),
+                _ => None,
+            };
+            if let Some(index) = checked_index {
+                item.setState(if checked[index] { 1 } else { 0 });
+            }
         }
     }
 }
