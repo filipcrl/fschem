@@ -1721,9 +1721,6 @@ impl Viewer {
                         if let Some(point) = response.interact_pointer_pos().map(|p| canvas.world(p)) {
                             current.select_at(point, self.show_hidden, response.double_clicked_by(PointerButton::Primary), ui.input(|input| input.modifiers.shift));
                         }
-                        if response.double_clicked_by(PointerButton::Primary) && !ui.input(|input| input.modifiers.shift) && current.selected_instance().is_some() {
-                            actions.push(Action::Descend(Descent::Symbol));
-                        }
                         ctx.request_repaint();
                     }
                     response.on_hover_cursor(if current.moving.is_some() {
