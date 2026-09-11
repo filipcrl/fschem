@@ -477,7 +477,8 @@ impl Display {
             let (timeline, timeline_response) =
                 ui.allocate_exact_size(Vec2::new(width, timeline_h), Sense::click_and_drag());
             ui.add_space(4.);
-            let (rect, response) = ui.allocate_exact_size(Vec2::new(width, graph_h), Sense::click_and_drag());
+            let (rect, response) =
+                ui.allocate_exact_size(Vec2::new(width, graph_h), Sense::click_and_drag());
 
             if let Some((mut min_x, mut max_x)) = self.x_range {
                 if response.hovered() || timeline_response.hovered() {
@@ -488,7 +489,11 @@ impl Display {
                     });
                     if scroll != 0. {
                         let pointer = ui.ctx().pointer_hover_pos().unwrap_or(rect.center());
-                        let zoom_rect = if timeline_response.hovered() { timeline } else { rect };
+                        let zoom_rect = if timeline_response.hovered() {
+                            timeline
+                        } else {
+                            rect
+                        };
                         let anchor = min_x
                             + ((pointer.x - zoom_rect.left()) / zoom_rect.width()).clamp(0., 1.)
                                 as f64
@@ -510,8 +515,10 @@ impl Display {
                     && let Some(pointer) = timeline_response.interact_pointer_pos()
                 {
                     self.timeline_dragging = true;
-                    let current_left = value_to_screen(min_x, full_x, timeline.left(), timeline.right());
-                    let current_right = value_to_screen(max_x, full_x, timeline.left(), timeline.right());
+                    let current_left =
+                        value_to_screen(min_x, full_x, timeline.left(), timeline.right());
+                    let current_right =
+                        value_to_screen(max_x, full_x, timeline.left(), timeline.right());
                     if pointer.x < current_left || pointer.x > current_right {
                         let width = max_x - min_x;
                         let center = timeline_screen_to_value(pointer.x, timeline, full_x);
@@ -532,8 +539,10 @@ impl Display {
                 } else if timeline_response.clicked()
                     && let Some(pointer) = timeline_response.interact_pointer_pos()
                 {
-                    let current_left = value_to_screen(min_x, full_x, timeline.left(), timeline.right());
-                    let current_right = value_to_screen(max_x, full_x, timeline.left(), timeline.right());
+                    let current_left =
+                        value_to_screen(min_x, full_x, timeline.left(), timeline.right());
+                    let current_right =
+                        value_to_screen(max_x, full_x, timeline.left(), timeline.right());
                     if pointer.x < current_left || pointer.x > current_right {
                         let width = max_x - min_x;
                         let center = full_x.0
@@ -556,7 +565,12 @@ impl Display {
             }
             let (min_x, max_x) = self.x_range.unwrap();
             let padding = (max_x - min_x) * 0.2;
-            let selected_count = self.selected.iter().filter(|&&selected| selected).count().max(1);
+            let selected_count = self
+                .selected
+                .iter()
+                .filter(|&&selected| selected)
+                .count()
+                .max(1);
             let base_columns = rect.width() * ui.ctx().pixels_per_point();
             // epaint tessellation cost is roughly proportional to total polyline
             // vertices, so keep the frame budget approximately constant when
@@ -582,22 +596,47 @@ impl Display {
             let groups = self.trace_groups();
             let painter = ui.painter();
             painter.rect_filled(rect, 0., Color32::from_rgb(18, 20, 24));
-            painter.rect_stroke(rect, 0., Stroke::new(1., Color32::DARK_GRAY), egui::StrokeKind::Inside);
+            painter.rect_stroke(
+                rect,
+                0.,
+                Stroke::new(1., Color32::DARK_GRAY),
+                egui::StrokeKind::Inside,
+            );
             painter.rect_filled(timeline, 0., Color32::from_rgb(14, 16, 19));
-            painter.rect_stroke(timeline, 0., Stroke::new(1., Color32::DARK_GRAY), egui::StrokeKind::Inside);
-            let plot_area = Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.bottom() - 26.));
+            painter.rect_stroke(
+                timeline,
+                0.,
+                Stroke::new(1., Color32::DARK_GRAY),
+                egui::StrokeKind::Inside,
+            );
+            let plot_area =
+                Rect::from_min_max(rect.min, Pos2::new(rect.right(), rect.bottom() - 26.));
             let row_h = plot_area.height() / groups.len().max(1) as f32;
             for (row, group) in groups.iter().enumerate() {
                 let row_rect = Rect::from_min_max(
                     Pos2::new(plot_area.left(), plot_area.top() + row as f32 * row_h),
-                    Pos2::new(plot_area.right(), plot_area.top() + (row + 1) as f32 * row_h),
-                ).shrink2(Vec2::new(64., 10.));
+                    Pos2::new(
+                        plot_area.right(),
+                        plot_area.top() + (row + 1) as f32 * row_h,
+                    ),
+                )
+                .shrink2(Vec2::new(64., 10.));
                 let y_bounds = self.group_bounds(group);
                 if row_rect.height() >= 8. {
                     draw_grid(painter, row_rect, (min_x, max_x), y_bounds);
-                    painter.line_segment([Pos2::new(row_rect.left(), row_rect.center().y), Pos2::new(row_rect.right(), row_rect.center().y)], Stroke::new(1., Color32::from_gray(50)));
+                    painter.line_segment(
+                        [
+                            Pos2::new(row_rect.left(), row_rect.center().y),
+                            Pos2::new(row_rect.right(), row_rect.center().y),
+                        ],
+                        Stroke::new(1., Color32::from_gray(50)),
+                    );
                 }
-                let unit = group.iter().map(|i| self.trace_unit(*i)).next().unwrap_or("");
+                let unit = group
+                    .iter()
+                    .map(|i| self.trace_unit(*i))
+                    .next()
+                    .unwrap_or("");
                 if row_rect.height() >= 24. {
                     draw_y_axis(painter, row_rect, y_bounds, unit);
                 }
@@ -639,20 +678,27 @@ impl Display {
             }
             let sel_l = value_to_screen(min_x, full_x, timeline.left(), timeline.right());
             let sel_r = value_to_screen(max_x, full_x, timeline.left(), timeline.right());
-            painter.rect_stroke(Rect::from_min_max(Pos2::new(sel_l, timeline.top()), Pos2::new(sel_r, timeline.bottom())), 0., Stroke::new(1., Color32::WHITE), egui::StrokeKind::Inside);
-            let x_unit = data.scale().map(|i| unit(&data.variables[i].kind)).unwrap_or("");
+            painter.rect_stroke(
+                Rect::from_min_max(
+                    Pos2::new(sel_l, timeline.top()),
+                    Pos2::new(sel_r, timeline.bottom()),
+                ),
+                0.,
+                Stroke::new(1., Color32::WHITE),
+                egui::StrokeKind::Inside,
+            );
+            let x_unit = data
+                .scale()
+                .map(|i| unit(&data.variables[i].kind))
+                .unwrap_or("");
             draw_x_axis(painter, plot_area, (min_x, max_x), x_unit, self.log_x);
 
             if response.hovered()
                 && let Some(pointer) = response.hover_pos()
             {
-                let x_left = plot_area.left() + 64.;
-                let x_right = plot_area.right() - 64.;
-                let x = min_x
-                    + ((pointer.x - x_left) / (x_right - x_left)).clamp(0., 1.) as f64
-                        * (max_x - min_x);
-                let cursor = PlotPoint::new(x, 0.);
-                if let Some((trace, point, screen)) = self.closest_trace(&groups, plot_area, pointer, cursor, (min_x, max_x)) {
+                if let Some((trace, point, screen)) =
+                    self.closest_trace(&groups, plot_area, pointer, (min_x, max_x))
+                {
                     let y_unit = self.trace_unit(trace.index);
                     painter.circle_filled(screen, 4.5, Color32::BLACK);
                     painter.circle_filled(screen, 3.2, trace_color(trace.index));
@@ -666,14 +712,21 @@ impl Display {
                                 ui.set_min_width(220.);
                                 ui.add(egui::Label::new(&trace.label).extend());
                                 ui.add(
-                                    egui::Label::new(egui::RichText::new(format!(
-                                        "x = {}\ny = {}",
-                                        si_value(
-                                            if self.log_x { 10_f64.powf(point.x) } else { point.x },
-                                            x_unit,
-                                        ),
-                                        si_value(point.y, y_unit)
-                                    )).monospace())
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "x = {}\ny = {}",
+                                            si_value(
+                                                if self.log_x {
+                                                    10_f64.powf(point.x)
+                                                } else {
+                                                    point.x
+                                                },
+                                                x_unit,
+                                            ),
+                                            si_value(point.y, y_unit)
+                                        ))
+                                        .monospace(),
+                                    )
                                     .extend(),
                                 );
                             });
@@ -684,18 +737,28 @@ impl Display {
     }
 
     fn trace_groups(&self) -> Vec<Vec<usize>> {
-        let selected: Vec<_> = self.traces.keys().copied().filter(|i| self.selected[*i]).collect();
+        let selected: Vec<_> = self
+            .traces
+            .keys()
+            .copied()
+            .filter(|i| self.selected[*i])
+            .collect();
         match self.group_mode {
             GroupMode::Overlay => vec![selected],
             GroupMode::Separate => selected.into_iter().map(|i| vec![i]).collect(),
             GroupMode::ByUnit => {
                 let mut map: BTreeMap<String, Vec<usize>> = BTreeMap::new();
                 for i in selected {
-                    map.entry(self.trace_unit(i).to_owned()).or_default().push(i);
+                    map.entry(self.trace_unit(i).to_owned())
+                        .or_default()
+                        .push(i);
                 }
                 map.into_values().collect()
             }
-        }.into_iter().filter(|g| !g.is_empty()).collect()
+        }
+        .into_iter()
+        .filter(|g| !g.is_empty())
+        .collect()
     }
     fn trace_unit(&self, index: usize) -> &str {
         let variable = &self.raw.plots[self.plot].variables[index];
@@ -713,20 +776,41 @@ impl Display {
             min = min.min(b.min()[1]);
             max = max.max(b.max()[1]);
         }
-        if !min.is_finite() || !max.is_finite() { (-1., 1.) } else if min == max { (min - 1., max + 1.) } else { (min, max) }
+        if !min.is_finite() || !max.is_finite() {
+            (-1., 1.)
+        } else if min == max {
+            (min - 1., max + 1.)
+        } else {
+            (min, max)
+        }
     }
-    fn closest_trace<'a>(&'a self, groups: &[Vec<usize>], rect: Rect, pointer: Pos2, cursor: PlotPoint, x_bounds: (f64, f64)) -> Option<(&'a Trace, PlotPoint, Pos2)> {
+    fn closest_trace<'a>(
+        &'a self,
+        groups: &[Vec<usize>],
+        rect: Rect,
+        pointer: Pos2,
+        x_bounds: (f64, f64),
+    ) -> Option<(&'a Trace, PlotPoint, Pos2)> {
         let row_h = rect.height() / groups.len().max(1) as f32;
-        groups.iter().enumerate().flat_map(|(row, group)| {
-            let row_rect = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + row as f32 * row_h), Pos2::new(rect.right(), rect.top() + (row + 1) as f32 * row_h)).shrink2(Vec2::new(64., 10.));
-            let y_bounds = self.group_bounds(group);
-            group.iter().filter_map(move |i| {
-                let trace = &self.traces[i];
-                let point = trace.series.interpolate(cursor)?;
-                let screen = point_to_screen(point, row_rect, x_bounds, y_bounds);
-                Some((trace, point, screen, (screen.y - pointer.y).abs()))
+        groups
+            .iter()
+            .enumerate()
+            .flat_map(|(row, group)| {
+                let row_rect = Rect::from_min_max(
+                    Pos2::new(rect.left(), rect.top() + row as f32 * row_h),
+                    Pos2::new(rect.right(), rect.top() + (row + 1) as f32 * row_h),
+                )
+                .shrink2(Vec2::new(64., 10.));
+                let y_bounds = self.group_bounds(group);
+                group.iter().filter_map(move |i| {
+                    let trace = &self.traces[i];
+                    closest_point_on_rendered_trace(trace, pointer, row_rect, x_bounds, y_bounds)
+                        .map(|(point, screen, distance)| (trace, point, screen, distance))
+                })
             })
-        }).min_by(|a, b| a.3.total_cmp(&b.3)).filter(|c| c.3 <= 16.).map(|(a,b,c,_)| (a,b,c))
+            .min_by(|a, b| a.3.total_cmp(&b.3))
+            .filter(|c| c.3 <= 18.)
+            .map(|(a, b, c, _)| (a, b, c))
     }
 
     fn prepare_traces(&mut self, ctx: &egui::Context) {
@@ -913,7 +997,10 @@ fn draw_y_axis(painter: &egui::Painter, row: Rect, bounds: (f64, f64), unit: &st
     let axis_unit = format!("{prefix}{unit}");
     let axis_x = row.left();
     painter.line_segment(
-        [Pos2::new(axis_x, row.top()), Pos2::new(axis_x, row.bottom())],
+        [
+            Pos2::new(axis_x, row.top()),
+            Pos2::new(axis_x, row.bottom()),
+        ],
         Stroke::new(1., Color32::from_gray(95)),
     );
     let step = nice_step(bounds.1 - bounds.0, (row.height() / 34.).max(2.) as f64);
@@ -943,7 +1030,11 @@ fn draw_y_axis(painter: &egui::Painter, row: Rect, bounds: (f64, f64), unit: &st
         painter.text(
             Pos2::new(axis_x - 7., y),
             egui::Align2::RIGHT_CENTER,
-            format!("{}{}", fixed_scaled_number(value, scale, precision), axis_unit),
+            format!(
+                "{}{}",
+                fixed_scaled_number(value, scale, precision),
+                axis_unit
+            ),
             font.clone(),
             color,
         );
@@ -1019,7 +1110,11 @@ fn draw_x_axis(
         painter.text(
             Pos2::new(x, y + 6.),
             egui::Align2::CENTER_TOP,
-            format!("{}{}", fixed_scaled_number(display_value, scale, precision), axis_unit),
+            format!(
+                "{}{}",
+                fixed_scaled_number(display_value, scale, precision),
+                axis_unit
+            ),
             font.clone(),
             color,
         );
@@ -1118,11 +1213,64 @@ fn value_to_screen(value: f64, bounds: (f64, f64), min: f32, max: f32) -> f32 {
     }
     min + ((value - bounds.0) / denom) as f32 * (max - min)
 }
+fn screen_to_value(value: f32, bounds: (f64, f64), min: f32, max: f32) -> f64 {
+    let denom = max - min;
+    if denom == 0. || !denom.is_finite() {
+        return (bounds.0 + bounds.1) * 0.5;
+    }
+    bounds.0 + ((value - min) / denom) as f64 * (bounds.1 - bounds.0)
+}
 fn point_to_screen(point: PlotPoint, rect: Rect, x: (f64, f64), y: (f64, f64)) -> Pos2 {
     Pos2::new(
         value_to_screen(point.x, x, rect.left(), rect.right()),
         value_to_screen(point.y, y, rect.bottom(), rect.top()),
     )
+}
+fn closest_point_on_rendered_trace(
+    trace: &Trace,
+    pointer: Pos2,
+    rect: Rect,
+    x: (f64, f64),
+    y: (f64, f64),
+) -> Option<(PlotPoint, Pos2, f32)> {
+    let mut best: Option<(PlotPoint, Pos2, f32)> = None;
+    for segment in &trace.series.rendered {
+        for point in segment {
+            let screen = point_to_screen(*point, rect, x, y);
+            let distance2 = screen.distance_sq(pointer);
+            if best.is_none_or(|(_, _, best_distance2)| distance2 < best_distance2) {
+                best = Some((*point, screen, distance2));
+            }
+        }
+        for points in segment.windows(2) {
+            let a = points[0];
+            let b = points[1];
+            let a_screen = point_to_screen(a, rect, x, y);
+            let b_screen = point_to_screen(b, rect, x, y);
+            let ab = b_screen - a_screen;
+            let ab_len2 = ab.length_sq();
+            if ab_len2 <= f32::EPSILON {
+                continue;
+            }
+            let t = ((pointer - a_screen).dot(ab) / ab_len2).clamp(0., 1.);
+            let screen = a_screen + ab * t;
+            let point = PlotPoint::new(a.x + (b.x - a.x) * t as f64, a.y + (b.y - a.y) * t as f64);
+            let distance2 = screen.distance_sq(pointer);
+            if best.is_none_or(|(_, _, best_distance2)| distance2 < best_distance2) {
+                best = Some((point, screen, distance2));
+            }
+        }
+    }
+    best.or_else(|| {
+        let cursor = PlotPoint::new(
+            screen_to_value(pointer.x, x, rect.left(), rect.right()),
+            screen_to_value(pointer.y, y, rect.bottom(), rect.top()),
+        );
+        let point = trace.series.interpolate(cursor)?;
+        let screen = point_to_screen(point, rect, x, y);
+        Some((point, screen, screen.distance_sq(pointer)))
+    })
+    .map(|(point, screen, distance2)| (point, screen, distance2.sqrt()))
 }
 fn draw_sampled_trace(
     painter: &egui::Painter,
@@ -1137,9 +1285,15 @@ fn draw_sampled_trace(
         if segment.is_empty() {
             continue;
         }
-        let points: Vec<_> = segment.iter().map(|p| point_to_screen(*p, rect, x, y)).collect();
+        let points: Vec<_> = segment
+            .iter()
+            .map(|p| point_to_screen(*p, rect, x, y))
+            .collect();
         if points.len() >= 2 {
-            painter.add(egui::Shape::line(points, Stroke::new(1., color.gamma_multiply(0.75))));
+            painter.add(egui::Shape::line(
+                points,
+                Stroke::new(1., color.gamma_multiply(0.75)),
+            ));
         }
     }
 }
@@ -1157,7 +1311,10 @@ fn draw_trace(
         if segment.is_empty() {
             continue;
         }
-        let points: Vec<_> = segment.iter().map(|p| point_to_screen(*p, rect, x, y)).collect();
+        let points: Vec<_> = segment
+            .iter()
+            .map(|p| point_to_screen(*p, rect, x, y))
+            .collect();
         if points.len() >= 2 {
             painter.add(egui::Shape::line(points.clone(), Stroke::new(1.4, color)));
         }
