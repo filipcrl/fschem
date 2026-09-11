@@ -11,12 +11,14 @@ use fschem::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
+    time::{Duration, Instant, SystemTime},
 };
 
 const DEMO: &str = include_str!("../examples/demo.sch");
@@ -31,9 +33,24 @@ pub struct Options {
     pub smoke_test: bool,
     pub screenshot: Option<PathBuf>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+impl FileStamp {
+    fn read(path: &Path) -> Option<Self> {
+        let metadata = fs::metadata(path).ok()?;
+        Some(Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
+}
 struct DocumentView {
     loaded: Arc<LoadedDocument>,
     saved: Arc<Document>,
+    file_stamp: Option<FileStamp>,
     cache: PaintCache,
     viewport: Viewport,
     layers: BTreeMap<u16, bool>,
@@ -66,8 +83,10 @@ struct WireState {
 impl DocumentView {
     fn new(loaded: Arc<LoadedDocument>, cache: PaintCache) -> Self {
         let target = loaded.path.clone().map(DocumentTarget::File);
+        let file_stamp = loaded.path.as_deref().and_then(FileStamp::read);
         Self {
             saved: Arc::clone(&loaded.document),
+            file_stamp,
             layers: loaded
                 .scene
                 .layers
@@ -117,6 +136,7 @@ impl DocumentView {
         for &layer in loaded.scene.layers.keys() {
             self.layers.entry(layer).or_insert(true);
         }
+        self.file_stamp = loaded.path.as_deref().and_then(FileStamp::read);
         self.loaded = Arc::new(loaded);
         self.target = Some(DocumentTarget::File(path));
         Ok(())
@@ -640,6 +660,7 @@ pub struct Viewer {
     ready_frames: usize,
     screenshot: Option<PathBuf>,
     screenshot_requested: bool,
+    last_file_check: Instant,
 }
 impl Viewer {
     pub fn new(ctx: &egui::Context, options: Options, smoke_success: Arc<AtomicBool>) -> Self {
@@ -674,6 +695,7 @@ impl Viewer {
             ready_frames: 0,
             screenshot: options.screenshot,
             screenshot_requested: false,
+            last_file_check: Instant::now(),
         };
         if let Some(path) = options.input {
             viewer.load(ctx, Some(path), false);
@@ -805,6 +827,39 @@ impl Viewer {
                 }
             }
         }
+        self.check_auto_reload(ctx);
+    }
+    fn check_auto_reload(&mut self, ctx: &egui::Context) {
+        ctx.request_repaint_after(Duration::from_secs(1));
+        if self.loading.is_some() || self.last_file_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_file_check = Instant::now();
+        let Some(current) = &mut self.current else {
+            return;
+        };
+        let Some(path) = current.loaded.path.clone() else {
+            return;
+        };
+        let Some(stamp) = FileStamp::read(&path) else {
+            return;
+        };
+        if current.file_stamp.is_none() {
+            current.file_stamp = Some(stamp);
+            return;
+        }
+        if current.file_stamp == Some(stamp) {
+            return;
+        }
+        if current.modified() {
+            current.file_stamp = Some(stamp);
+            self.error = Some(format!(
+                "{} changed on disk, but this view has unsaved edits. Use Reload to discard local edits or Save to overwrite the file.",
+                path.display()
+            ));
+            return;
+        }
+        self.load_target(ctx, Some(DocumentTarget::File(path)), false);
     }
     fn can_export(&self) -> bool {
         self.export.is_none()
