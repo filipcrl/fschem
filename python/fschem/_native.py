@@ -18,7 +18,7 @@ def ngspice_inputs(deck: str, source: Path):
     files = {}
     visited = {}
 
-    def relocate(text, base):
+    def relocate(text, base, command_context=False):
         lines = []
         for line in text.splitlines():
             tokens = list(_TOKEN.finditer(line))
@@ -26,9 +26,15 @@ def ngspice_inputs(deck: str, source: Path):
                 lines.append(line)
                 continue
             command = tokens[0].group().lower()
+            if command == ".control":
+                command_context = True
+            elif command == ".endc":
+                command_context = False
             # .lib SECTION opens a definition; .lib FILE SECTION loads a file.
-            is_include = command in {".include", ".inc", "source"} or (command == ".lib" and len(tokens) >= 3)
-            if is_include or command in {"osdi", "pre_osdi"}:
+            is_include = (command in {".include", ".inc"}
+                          or (command_context and command == "source")
+                          or (command == ".lib" and len(tokens) >= 3))
+            if is_include or (command_context and command in {"osdi", "pre_osdi"}):
                 if len(tokens) < 2:
                     raise ValueError(f"missing native path: {line}")
                 token = tokens[1]
@@ -45,7 +51,7 @@ def ngspice_inputs(deck: str, source: Path):
                     if path not in visited:
                         name = f"inputs/{len(visited):04d}.inc"
                         visited[path] = name
-                        files[name] = relocate(path.read_text(), path.parent)
+                        files[name] = relocate(path.read_text(), path.parent, command_context)
                     value = visited[path]
                 else:
                     value = str(path)
@@ -58,7 +64,7 @@ def ngspice_inputs(deck: str, source: Path):
     deck = relocate(deck, source.parent)
     startup = source.parent / ".spiceinit"
     if startup.is_file():
-        files[".spiceinit"] = relocate(startup.read_text(), source.parent)
+        files[".spiceinit"] = relocate(startup.read_text(), source.parent, True)
     lines = deck.splitlines()
     endcs = [i for i, line in enumerate(lines) if line.strip().lower() == ".endc"]
     control = False

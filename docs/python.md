@@ -93,6 +93,8 @@ See `examples/python_native.py` for a runnable export/raw-inspection example.
 
 ## Native simulation lifecycle (POSIX)
 
+See `examples/python_run.py` for an executable divider experiment for either engine.
+
 ```python
 sim = fschem.Simulation(circuit, mode="native")
 prepared = sim.prepare(backend="ngspice")  # Rust netlisting, no process launched

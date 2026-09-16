@@ -212,7 +212,7 @@ def test_real_ngspice_control_multi_analysis(tmp_path):
 
 
 def test_vacask_merged_local_config_and_relative_include(tmp_path):
-    import tomllib
+    from fschem._native import tomllib
     source_dir = tmp_path / 'source with spaces'
     source_dir.mkdir()
     (source_dir / 'models').mkdir()
@@ -271,3 +271,27 @@ def test_preexisting_raw_is_not_published(tmp_path):
     with pytest.raises(fschem.SimulationError, match='already contains'):
         run.execute(executable=success(tmp_path))
     assert run.manifest['results'] == []
+
+
+def test_real_ngspice_dot_multi_analysis(tmp_path):
+    if not shutil.which('ngspice'):
+        pytest.skip('ngspice not installed')
+    source = tmp_path / 'multi.sch'
+    source.write_text((ROOT / 'examples/spice.sch').read_text().replace('value=".op"', 'value=".op\n.tran 1n 10n\n.ac dec 2 1 10"'))
+    home = tmp_path / 'home'
+    home.mkdir()
+    sim = fschem.Simulation(fschem.Project(tmp_path).load(source), mode='native')
+    run = sim.run(backend='ngspice', directory=tmp_path / 'run', env={'HOME': str(home)}, timeout=30)
+    assert len(run.results) == 3
+    assert run.result('Transient Analysis').time.size > 0
+    assert run.result('AC Analysis').frequency.size > 0
+
+
+def test_nonposix_run_refuses_before_artifacts(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import fschem.simulation as implementation
+    p = prepared()
+    monkeypatch.setattr(implementation, 'os', SimpleNamespace(name='nt'))
+    with pytest.raises(fschem.UnsupportedPlatform, match='POSIX'):
+        p.run(directory=tmp_path / 'unsupported')
+    assert not (tmp_path / 'unsupported').exists()
