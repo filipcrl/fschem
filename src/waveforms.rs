@@ -30,6 +30,14 @@ fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("fschem-waveforms")
 }
 impl Waveforms {
+    #[cfg(test)]
+    pub(crate) fn test_link(&self, edit: Option<(&str, &str)>) -> Option<GraphTarget> {
+        let mut state = self.state.lock().unwrap();
+        let link = state.link.as_mut()?;
+        if let Some((key, value)) = edit { link.pending.insert(key.into(), value.into()); }
+        Some(link.target)
+    }
+
     pub(crate) fn open_graph(&mut self, ctx: &egui::Context, target: GraphTarget, path: PathBuf, properties: fschem::document::Properties) {
         let mut state = self.state.lock().unwrap();
         state.data = None;
@@ -263,6 +271,54 @@ impl WindowState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn linked_load_refresh_and_detach_keep_data_without_feedback() {
+        let path = std::env::temp_dir().join(format!("fschem-linked-window-{}.raw", std::process::id()));
+        std::fs::write(&path, b"Title: test\nPlotname: Transient\nFlags: real\nNo. Variables: 3\nNo. Points: 2\nVariables:\n0 time time\n1 v(out) voltage\n2 i(v1) current\nValues:\n0 0\n2\n0.01\n1 1\n3\n0.02\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut window = Waveforms::default();
+        let target = GraphTarget { document: 10, record: 20 };
+        let properties = fschem::document::Properties::parse("node=i(v1) groupmode=separate x1=0.2 x2=0.8".into());
+        window.open_graph(&ctx, target, path.clone(), properties.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut state = window.state.lock().unwrap();
+            state.poll();
+            if state.loading.is_none() { break; }
+            assert!(std::time::Instant::now() < deadline);
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        {
+            let state = window.state.lock().unwrap();
+            let data = state.data.as_ref().unwrap();
+            assert_eq!(data.configuration()["node"], "i(v1)");
+            assert_eq!(data.configuration()["groupmode"], "separate");
+            assert_eq!(data.x_range(), Some((0.2, 0.8)));
+        }
+        let updated = fschem::document::Properties::parse("node=out groupmode=overlay".into());
+        window.sync_graph(&ctx, |owner, previous, edits| {
+            assert_eq!(owner, target);
+            assert_eq!(previous.raw, properties.raw);
+            assert!(edits.is_empty(), "opening a graph must not mark it dirty");
+            Some((path.clone(), updated.clone()))
+        });
+        {
+            let state = window.state.lock().unwrap();
+            assert_eq!(state.data.as_ref().unwrap().configuration()["node"], "v(out)");
+            assert!(state.link.as_ref().unwrap().pending.is_empty());
+        }
+        window.test_link(Some(("node", "queued")));
+        window.sync_graph(&ctx, |_, _, _| None);
+        let state = window.state.lock().unwrap();
+        assert!(state.detached);
+        assert!(state.link.is_none());
+        assert!(state.data.is_some(), "detachment retains inspectable data");
+        drop(state);
+        window.sync_graph(&ctx, |_, _, _| panic!("detached updates must not reach the owner"));
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn explicit_invalid_plot_stays_unavailable_across_retry() {
         let path = std::env::temp_dir().join(format!("fschem-plot-selection-{}.raw", std::process::id()));

@@ -250,10 +250,8 @@ impl Display {
 
     /// Configure a schematic graph using xschem's graph properties.
     pub(crate) fn configure(&mut self, props: &fschem::document::Properties) {
-        if let Some(index) = props.get("dataset").and_then(|s| s.parse::<usize>().ok()) {
-            self.plot = index.min(self.raw.plots.len() - 1);
-            self.select_plot();
-        }
+        self.plot = props.get("dataset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0).min(self.raw.plots.len() - 1);
+        self.select_plot();
         if let Some(nodes) = props.get("node") {
             let names: Vec<_> = nodes
                 .split_whitespace()
@@ -324,19 +322,20 @@ impl Display {
         props: &fschem::document::Properties,
     ) {
         self.prepare_traces(ui.ctx());
-        if self.group_mode == GroupMode::Separate && self.selected.iter().any(|s| *s) {
+        if self.group_mode != GroupMode::Overlay && !self.trace_groups().is_empty() {
             let selected = self.selected.clone();
-            let indices: Vec<_> = selected.iter().enumerate().filter_map(|(i, s)| s.then_some(i)).collect();
+            let mode = self.group_mode;
+            let groups = self.trace_groups();
             self.group_mode = GroupMode::Overlay;
-            for (row, index) in indices.iter().enumerate() {
+            for (row, group) in groups.iter().enumerate() {
                 self.selected.fill(false);
-                self.selected[*index] = true;
-                let height = rect.height() / indices.len() as f32;
+                for &index in group { self.selected[index] = true; }
+                let height = rect.height() / groups.len() as f32;
                 let panel = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + row as f32 * height), Pos2::new(rect.right(), rect.top() + (row + 1) as f32 * height));
                 self.paint_embedded(ui, panel, props);
             }
             self.selected = selected;
-            self.group_mode = GroupMode::Separate;
+            self.group_mode = mode;
             return;
         }
         self.prepare_traces(ui.ctx());
@@ -1482,6 +1481,39 @@ fn trace_color(index: usize) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn linked_configuration_and_stacked_render_preserve_selection_and_limits() {
+        let raw = RawFile::parse(b"Title: test\nPlotname: Transient\nFlags: real\nNo. Variables: 3\nNo. Points: 2\nVariables:\n0 time time\n1 v(out) voltage\n2 i(v1) current\nValues:\n0 0\n2\n0.01\n1 1\n3\n0.02\n").unwrap();
+        let mut display = Display::new("missing.raw".into(), raw);
+        let props = fschem::document::Properties::parse("node=\"out i(v1)\" groupmode=separate logx=0 x1=0.2 x2=0.8 y1=-2 y2=4 mode=real".into());
+        display.configure(&props);
+        assert_eq!(display.x_range(), Some((0.2, 0.8)));
+        assert_eq!(display.group_bounds(&[1]), (-2., 4.));
+        assert_eq!(display.configuration()["groupmode"], "separate");
+        assert_eq!(display.configuration()["node"], "v(out) i(v1)");
+        let selected = display.selected.clone();
+        let ctx = egui::Context::default();
+        let mut output = None;
+        for _ in 0..50 {
+            output = Some(ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| display.paint_embedded(ui, Rect::from_min_size(Pos2::ZERO, Vec2::new(600., 400.)), &props));
+            }));
+            if display.traces.len() == 2 { break; }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(display.selected, selected);
+        assert_eq!(display.trace_groups(), vec![vec![1], vec![2]]);
+        let labels: Vec<_> = output.unwrap().shapes.into_iter().filter_map(|shape| match shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text.contains("v(out)") || text.galley.job.text.contains("i(v1)") => Some(text.pos.y), _ => None,
+        }).collect();
+        assert_eq!(labels.len(), 2);
+        assert!(labels[1] - labels[0] > 150., "traces occupy different panels");
+        display.configure(&fschem::document::Properties::parse("node=out".into()));
+        assert_eq!(display.group_mode, GroupMode::Overlay);
+        assert_eq!(display.x_range(), None);
+        assert_eq!(display.y_range, None);
+    }
+
     #[test]
     fn raw_open_discovers_matching_manifest_aliases_only() {
         let root = std::env::temp_dir().join(format!("fschem-graph-alias-{}", std::process::id()));

@@ -2795,6 +2795,92 @@ mod tests {
         assert!(edits.is_empty());
     }
 
+    fn linked_graph_view() -> DocumentView {
+        let document = Document::parse("v {xschem file_version=1.3}\nN 0 0 10 0 {}\nB 2 0 0 400 200 {flags=graph rawfile=missing.raw node=out custom=retained}\nB 2 0 250 400 450 {flags=graph node=in}\n").unwrap();
+        let loaded = Arc::new(LoadedDocument::from_document(Arc::new(document), None, LibraryPaths::default()).unwrap());
+        DocumentView::new(loaded.clone(), PaintCache::new(&loaded.scene))
+    }
+
+    #[test]
+    fn linked_graph_identity_survives_shift_copy_and_history() {
+        let paths = LibraryPaths::default();
+        let mut view = linked_graph_view();
+        let id = view.record_ids[2];
+        assert_eq!(view.graph_at(Some(Point::new(20., 300.))), Some(3));
+        view.selected = BTreeSet::from([Selection::Primitive(2)]);
+        assert_eq!(view.graph_at(Some(Point::new(20., 300.))), Some(2));
+        view.selected = BTreeSet::from([Selection::Wire(1)]);
+        view.delete_selection(&paths).unwrap();
+        assert_eq!(view.record_ids[1], id);
+        view.undo(&paths).unwrap();
+        assert_eq!(view.record_ids[2], id);
+        view.redo(&paths).unwrap();
+        assert_eq!(view.record_ids[1], id);
+        let before = EditState { document: view.loaded.document.clone(), selection: BTreeSet::from([1]) };
+        view.execute_command(EditOperation::Copy(Placement { pivot: Point::default(), at: Point::default(), rotation: 0, flip: false }), before, &paths).unwrap();
+        assert_eq!(view.record_ids[1], id);
+        assert_ne!(*view.record_ids.last().unwrap(), id);
+        view.undo(&paths).unwrap();
+        view.redo(&paths).unwrap();
+        assert_eq!(view.record_ids[1], id);
+    }
+
+    #[test]
+    fn linked_graph_updates_parked_origin_undo_and_detaches_on_replacement() {
+        let ctx = egui::Context::default();
+        let mut viewer = Viewer::new(&ctx, Options { input: None, open_as_text: false, open_run: false, libraries: LibraryPaths::default(), smoke_test: false, screenshot: None }, Arc::new(AtomicBool::new(false)));
+        viewer.current = Some(linked_graph_view());
+        viewer.pointer = Some(Point::new(20., 20.));
+        viewer.action(&ctx, Action::Descend(Descent::Schematic));
+        let target = viewer.waveforms.test_link(Some(("groupmode", "separate"))).unwrap();
+        let origin = viewer.current.take();
+        viewer.tabs.push(DocumentTab { current: origin, ..Default::default() });
+        viewer.current = Some(linked_graph_view());
+        viewer.sync_linked_graph(&ctx);
+        assert!(!viewer.current.as_ref().unwrap().modified());
+        let origin = viewer.tabs.last_mut().unwrap().current.as_mut().unwrap();
+        assert_eq!(origin.identity, target.document);
+        assert!(origin.modified());
+        assert_eq!(origin.graph_properties(2).unwrap().get("groupmode"), Some("separate"));
+        assert_eq!(origin.graph_properties(2).unwrap().get("custom"), Some("retained"));
+        assert_eq!(origin.history.undo_label(), Some("Edit graph"));
+        origin.undo(&viewer.paths).unwrap();
+        viewer.waveforms.test_link(Some(("node", "stale")));
+        viewer.sync_linked_graph(&ctx);
+        let origin = viewer.tabs.last().unwrap().current.as_ref().unwrap();
+        assert!(!origin.modified(), "undo wins over queued stale viewport changes");
+        // Hierarchy parking also retains the same owner.
+        viewer.navigation_stack.push(viewer.tabs.last_mut().unwrap().current.take().unwrap());
+        viewer.waveforms.test_link(Some(("node", "in")));
+        viewer.sync_linked_graph(&ctx);
+        assert_eq!(viewer.navigation_stack[0].graph_properties(2).unwrap().get("node"), Some("in"));
+        // Reload/close replace or remove the session owner, never retarget by path/index.
+        viewer.navigation_stack.clear();
+        viewer.waveforms.test_link(Some(("node", "wrong")));
+        viewer.sync_linked_graph(&ctx);
+        assert!(viewer.waveforms.test_link(None).is_none());
+        assert!(!viewer.current.as_ref().unwrap().modified());
+    }
+
+    #[test]
+    fn deleting_linked_graph_detaches_without_retargeting_neighbor() {
+        let ctx = egui::Context::default();
+        let mut viewer = Viewer::new(&ctx, Options { input: None, open_as_text: false, open_run: false, libraries: LibraryPaths::default(), smoke_test: false, screenshot: None }, Arc::new(AtomicBool::new(false)));
+        viewer.current = Some(linked_graph_view());
+        viewer.pointer = Some(Point::new(20., 20.));
+        viewer.action(&ctx, Action::Descend(Descent::Schematic));
+        viewer.waveforms.test_link(Some(("node", "wrong")));
+        let view = viewer.current.as_mut().unwrap();
+        view.selected = BTreeSet::from([Selection::Primitive(2)]);
+        view.delete_selection(&viewer.paths).unwrap();
+        viewer.sync_linked_graph(&ctx);
+        assert!(viewer.waveforms.test_link(None).is_none());
+        assert_eq!(viewer.current.as_ref().unwrap().graph_properties(2).unwrap().get("node"), Some("in"));
+        viewer.current.as_mut().unwrap().undo(&viewer.paths).unwrap();
+        viewer.sync_linked_graph(&ctx);
+        assert!(viewer.waveforms.test_link(None).is_none(), "deletion detaches until explicit E");
+    }
+
     fn selection_view() -> DocumentView {
         let source = "v {xschem file_version=1.3}\nC {test.sym} 0 0 0 0 {name=X1}\n[\nL 4 -10 -10 10 10 {}\n]\nN0 0 100 0 {lab=signal}\nN 0 0 100 100 {}\nN -100 50 150 50 {}\nN 200 200 200 200 {}\n";
         let loaded = Arc::new(
