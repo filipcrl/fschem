@@ -1653,10 +1653,8 @@ impl Viewer {
             let properties = view.graph_properties(index)?;
             // A schematic edit/undo wins over a queued viewport edit from an older snapshot.
             if properties.raw == previous.raw && !edits.is_empty() && view.moving.is_none() {
-                let selection = view.selected.clone();
-                let before = EditState { document: view.loaded.document.clone(), selection: BTreeSet::from([index]) };
-                if let Err(message) = view.execute_command(EditOperation::SetGraphConfiguration { properties: edits }, before, paths) { *error = Some(message); }
-                view.selected = selection;
+                let before = view.edit_state();
+                if let Err(message) = view.execute_command(EditOperation::SetGraphConfiguration { records: BTreeSet::from([index]), properties: edits }, before, paths) { *error = Some(message); }
             }
             let properties = view.graph_properties(index)?.clone();
             let path = crate::schematic_graphs::raw_path(view.loaded.path.as_deref(), &properties)?;
@@ -2833,6 +2831,7 @@ mod tests {
         viewer.pointer = Some(Point::new(20., 20.));
         viewer.action(&ctx, Action::Descend(Descent::Schematic));
         let target = viewer.waveforms.test_link(Some(("groupmode", "separate"))).unwrap();
+        viewer.current.as_mut().unwrap().selected = BTreeSet::from([Selection::Wire(1)]);
         let origin = viewer.current.take();
         viewer.tabs.push(DocumentTab { current: origin, ..Default::default() });
         viewer.current = Some(linked_graph_view());
@@ -2844,6 +2843,12 @@ mod tests {
         assert_eq!(origin.graph_properties(2).unwrap().get("groupmode"), Some("separate"));
         assert_eq!(origin.graph_properties(2).unwrap().get("custom"), Some("retained"));
         assert_eq!(origin.history.undo_label(), Some("Edit graph"));
+        let selection = BTreeSet::from([Selection::Wire(1)]);
+        assert_eq!(origin.selected, selection);
+        origin.undo(&viewer.paths).unwrap();
+        assert_eq!(origin.selected, selection);
+        origin.redo(&viewer.paths).unwrap();
+        assert_eq!(origin.selected, selection);
         origin.undo(&viewer.paths).unwrap();
         viewer.waveforms.test_link(Some(("node", "stale")));
         viewer.sync_linked_graph(&ctx);
@@ -2860,6 +2865,27 @@ mod tests {
         viewer.sync_linked_graph(&ctx);
         assert!(viewer.waveforms.test_link(None).is_none());
         assert!(!viewer.current.as_ref().unwrap().modified());
+    }
+
+    #[test]
+    fn linked_graph_rejects_edits_during_movement_without_history() {
+        let ctx = egui::Context::default();
+        let mut viewer = Viewer::new(&ctx, Options { input: None, open_as_text: false, open_run: false, libraries: LibraryPaths::default(), smoke_test: false, screenshot: None }, Arc::new(AtomicBool::new(false)));
+        viewer.current = Some(linked_graph_view());
+        viewer.pointer = Some(Point::new(20., 20.));
+        viewer.action(&ctx, Action::Descend(Descent::Schematic));
+        let view = viewer.current.as_mut().unwrap();
+        view.selected = BTreeSet::from([Selection::Wire(1)]);
+        view.begin_move(Point::default());
+        assert!(view.moving.is_some());
+        viewer.waveforms.test_link(Some(("groupmode", "separate")));
+        viewer.sync_linked_graph(&ctx);
+        let view = viewer.current.as_mut().unwrap();
+        assert_eq!(view.graph_properties(2).unwrap().get("groupmode"), None);
+        assert!(view.history.undo_label().is_none());
+        view.commit_move(&viewer.paths).unwrap();
+        viewer.sync_linked_graph(&ctx);
+        assert_eq!(viewer.current.as_ref().unwrap().graph_properties(2).unwrap().get("groupmode"), None);
     }
 
     #[test]

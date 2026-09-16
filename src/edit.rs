@@ -42,7 +42,7 @@ pub enum EditOperation {
     Wire { start: Point, end: Point },
     SetInstanceProperty { key: String, value: String },
     SetRecordProperty { key: String, value: String },
-    SetGraphConfiguration { properties: std::collections::BTreeMap<String, String> },
+    SetGraphConfiguration { records: BTreeSet<usize>, properties: std::collections::BTreeMap<String, String> },
 }
 
 /// A command prepares its result; the receiver installs it before history changes.
@@ -82,9 +82,9 @@ impl EditCommand for DocumentCommand {
         if self.after.is_none() {
             let mut state = self.before.clone();
             match self.operation {
-                EditOperation::SetGraphConfiguration { ref properties } => {
+                EditOperation::SetGraphConfiguration { ref records, ref properties } => {
                     for (key, value) in properties {
-                        state.document = Arc::new(state.document.with_record_property(&state.selection, key, value)?);
+                        state.document = Arc::new(state.document.with_record_property(records, key, value)?);
                     }
                 }
                 EditOperation::Move(placement) => placement.apply(&mut state)?,

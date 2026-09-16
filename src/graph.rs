@@ -591,7 +591,8 @@ impl Display {
                     self.omitted += trace.omitted;
                 }
             }
-            if !full_bounds.is_finite() {
+            let provisional_bounds = !full_bounds.is_finite();
+            if provisional_bounds {
                 full_bounds = PlotBounds::from_min_max([0., -1.], [1., 1.]);
             }
             if !full_bounds.is_valid_x() {
@@ -601,7 +602,8 @@ impl Display {
             }
             if self.fit || self.x_range.is_none() {
                 self.x_range = Some((full_bounds.min()[0], full_bounds.max()[0]));
-                self.fit = false;
+                // Do not consume an auto-fit request until all pending traces arrive.
+                self.fit = self.preparing.is_some();
             }
 
             let timeline_h = 34.;
@@ -614,7 +616,7 @@ impl Display {
             let (rect, response) =
                 ui.allocate_exact_size(Vec2::new(width, graph_h), Sense::click_and_drag());
 
-            if let Some((mut min_x, mut max_x)) = self.x_range {
+            if !provisional_bounds && let Some((mut min_x, mut max_x)) = self.x_range {
                 if response.hovered() || timeline_response.hovered() {
                     let scroll = ui.ctx().input_mut(|input| {
                         let delta = input.smooth_scroll_delta.y;
@@ -967,7 +969,7 @@ impl Display {
         {
             self.preparing = None;
             self.traces.extend(traces.into_iter().map(|t| (t.index, t)));
-            self.fit = self.x_range.is_none();
+            self.fit |= self.x_range.is_none();
             self.dirty = true;
         }
         if !self.dirty {
@@ -1481,6 +1483,33 @@ fn trace_color(index: usize) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delayed_preparation_fits_data_but_preserves_explicit_limits() {
+        let ctx = egui::Context::default();
+        for explicit in [false, true] {
+            let raw = RawFile::parse(b"Title: test\nPlotname: Transient\nFlags: real\nNo. Variables: 2\nNo. Points: 2\nVariables:\n0 time time\n1 v(out) voltage\nValues:\n0 100\n2\n1 200\n3\n").unwrap();
+            let mut display = Display::new("missing.raw".into(), raw);
+            let props = if explicit { "node=out x1=120 x2=180" } else { "node=out" };
+            display.configure(&fschem::document::Properties::parse(props.into()));
+            display.traces.clear();
+            let (tx, rx) = mpsc::channel();
+            display.preparing = Some(Preparation { receiver: rx, cancelled: Arc::new(AtomicBool::new(false)) });
+            // Deliberately render before the worker can send any data.
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| display.graph_ui(ui, 400.));
+            });
+            assert_eq!(display.fit, !explicit);
+            assert_eq!(display.x_range, Some(if explicit { (120., 180.) } else { (0., 1.) }));
+            tx.send(vec![Trace::new(&display.raw.plots[0], 1, display.mode, display.log_x, &display.aliases[0])]).unwrap();
+            display.prepare_traces(&ctx);
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| display.graph_ui(ui, 400.));
+            });
+            assert_eq!(display.x_range, Some(if explicit { (120., 180.) } else { (100., 200.) }));
+            assert!(!display.fit);
+        }
+    }
+
     #[test]
     fn linked_configuration_and_stacked_render_preserve_selection_and_limits() {
         let raw = RawFile::parse(b"Title: test\nPlotname: Transient\nFlags: real\nNo. Variables: 3\nNo. Points: 2\nVariables:\n0 time time\n1 v(out) voltage\n2 i(v1) current\nValues:\n0 0\n2\n0.01\n1 1\n3\n0.02\n").unwrap();

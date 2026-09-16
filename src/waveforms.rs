@@ -50,6 +50,7 @@ impl Waveforms {
         let mut state = self.state.lock().unwrap();
         let Some(mut link) = state.link.take() else { return; };
         if !state.open { return; }
+        let had_pending = !link.pending.is_empty();
         let Some((path, properties)) = sync(link.target, &link.properties, std::mem::take(&mut link.pending)) else {
             state.detached = true;
             return;
@@ -57,7 +58,8 @@ impl Waveforms {
         if state.watched.as_ref() != Some(&path) {
             state.data = None;
             state.load_selected(ctx, path, None);
-        } else if properties.raw != link.properties.raw {
+        } else if had_pending || properties.raw != link.properties.raw {
+            // Rejected edits (including movement-blocked edits) restore the owner snapshot.
             if let Some(data) = &mut state.data { data.configure(&properties); }
         }
         link.properties = properties;
@@ -306,6 +308,22 @@ mod tests {
         {
             let state = window.state.lock().unwrap();
             assert_eq!(state.data.as_ref().unwrap().configuration()["node"], "v(out)");
+            assert!(state.link.as_ref().unwrap().pending.is_empty());
+        }
+        // A blocked owner returns its unchanged snapshot: discard the viewport edit
+        // and restore the display, even though source properties did not change.
+        {
+            let mut state = window.state.lock().unwrap();
+            state.data.as_mut().unwrap().configure(&fschem::document::Properties::parse("node=out groupmode=separate".into()));
+        }
+        window.test_link(Some(("groupmode", "separate")));
+        window.sync_graph(&ctx, |_, previous, edits| {
+            assert_eq!(edits["groupmode"], "separate");
+            Some((path.clone(), previous.clone()))
+        });
+        {
+            let state = window.state.lock().unwrap();
+            assert_eq!(state.data.as_ref().unwrap().configuration()["groupmode"], "overlay");
             assert!(state.link.as_ref().unwrap().pending.is_empty());
         }
         window.test_link(Some(("node", "queued")));
