@@ -12,6 +12,7 @@ pub enum Command {
     Redo,
     Edit(egui::Key),
     Open,
+    OpenText,
     Save,
     SaveAs,
     CloseTab,
@@ -50,6 +51,7 @@ define_class!(
         fn perform_command(&self, sender: &NSMenuItem) {
             let command = match sender.tag() {
                 0 => Command::Open,
+                40 => Command::OpenText,
                 1 => Command::Demo,
                 2 => Command::Reload,
                 3 => Command::Fit,
@@ -128,6 +130,7 @@ impl NativeMenu {
                 "File",
                 vec![
                     ("Open…", "o", 0),
+                    ("Open as text…", "", 40),
                     ("Save", "s", 13),
                     ("Save As…", "s", 14),
                     ("Close tab", "w", 16),
@@ -252,6 +255,7 @@ impl NativeMenu {
     pub fn sync(
         &self,
         document: bool,
+        text: bool,
         export: bool,
         selected: bool,
         back: bool,
@@ -260,7 +264,8 @@ impl NativeMenu {
     ) {
         for item in &self.items {
             match item.tag() {
-                2 | 3 => item.setEnabled(document),
+                2 => item.setEnabled(document || text),
+                3 => item.setEnabled(document),
                 12 | 20 => item.setEnabled(export),
                 13 | 14 => item.setEnabled(edit[1]),
                 100..=102 => item.setEnabled(edit[0]),
