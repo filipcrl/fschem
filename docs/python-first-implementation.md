@@ -39,4 +39,14 @@ Use a versioned generated `run.json`, atomic updates, and immutable/fresh run di
 
 ## Working rules
 
-One writer at a time in this checkout. Reviewers are read-only. Each implementation stage reads this plan and preceding stage's report, tests its seam, commits its changes frequently, and reports concrete commands, commit IDs, API/schema decisions and residual risks. Ask the supervisor before destructive actions or changing architecture/scope. Infrastructure failure is a blocker, not permission to change execution protocol.
+One writer at a time per checkout/worktree. Reviewers are read-only. The user requested parallel implementation after stage 1; the initial sequential workflow was stopped at a clean committed checkpoint (665c68c and 6374cae). Continue with isolated lanes below, then a serial integration gate. Each implementation stage reads this plan and preceding stage's report, tests its seam, commits its changes frequently, and reports concrete commands, commit IDs, API/schema decisions and residual risks. Ask the supervisor before destructive actions or changing architecture/scope. Infrastructure failure is a blocker, not permission to change execution protocol.
+
+## Parallel lane board
+
+| Lane | Checkout / branch | Ownership | Gate / handoff | Independence |
+|---|---|---|---|---|
+| Python/compiler | `../fschem-worktrees/python-core`, `feature/python-sim-core` | Python API/runners, Rust compiler/technology/bindings, non-GUI tests and Python docs | Runner and portable compiler tests, frequent commits; integration merges named branch | Does not change GUI files or CLI dispatch |
+| Text viewer | `../fschem-worktrees/text-viewer`, `feature/text-viewer` | `src/viewer.rs`, `src/main.rs`, `src/macos_menu.rs`, new text-viewer module/tests | Text and GUI regression tests, frequent commits; integration merges named branch | No dependency on run manifest or Python API; run-artifact UI deferred to integration |
+| Integration | Main checkout, `master`, only after both writers finish | Merge both branches, resolve conflicts, run manifest/UI/Python launcher integration and docs | End-to-end tests then fresh parallel reviews | Sole writer after dependency barrier |
+
+Both lane worktrees are persistent local Git worktrees, allocated by the parent before launch. No child may edit another lane checkout. Read-only integration inputs remain at `/Users/filipcorlan/work/ihp-adc` and `/Users/filipcorlan/work/IHP-Open-PDK` (their relative locations differ in lane worktrees). Keep worktrees until parent acceptance; no automatic branch deletion. All child agents use medium thinking. Reviews run concurrently after integration and precede a single fix writer.
