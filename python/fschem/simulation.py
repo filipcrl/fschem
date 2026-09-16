@@ -231,7 +231,8 @@ class Run:
         results = self.results
         if name in results:
             return results[name]
-        matches = [r for r in results.values() if r.name == name]
+        matches = [results[item["id"]] for item in self._manifest["results"]
+                   if item["name"] == name or item["analysis_name"] == name]
         if len(matches) != 1:
             raise KeyError(f"unknown or ambiguous analysis {name!r}; use a result ID: {list(results)}")
         return matches[0]
@@ -259,6 +260,8 @@ class Run:
             for name, digest in data["input_sha256"].items():
                 if _digest(_artifact(self.directory, name)) != digest:
                     raise ValueError(f"prepared input changed: {name}")
+            if list(self.directory.glob("*.raw")) or (self.directory / "simulator.log").exists():
+                raise ValueError("prepared run already contains simulator outputs")
             environment = dict(os.environ)
             if env is not None:
                 environment.update(env)
@@ -274,6 +277,7 @@ class Run:
             data["options"] = {"timeout_seconds": timeout}
             data["execution"] = {"argv": command, "cwd": str(self.directory),
                                  "executable": program, "version": None,
+                                 "executable_sha256": _digest(Path(program)) if resolved else None,
                                  "environment": {k: environment[k] for k in sorted(_ENV_VALUES & environment.keys())},
                                  "environment_override_keys": sorted(env or {}),
                                  "environment_policy": "inherited plus explicit overrides; values allowlisted",
@@ -313,6 +317,7 @@ class Run:
                     if not result.signals or any(len(a) == 0 for a in result.signals.values()):
                         raise ValueError(f"empty raw analysis: {path.name}")
                     published.append({"id": f"{path.name}#{index}", "name": result.name,
+                                      "analysis_name": path.stem,
                                       "path": path.name, "plot_index": index, "sha256": _digest(path),
                                       "signals": list(result.signals),
                                       "signal_map": {name: name for name in result.signals}})

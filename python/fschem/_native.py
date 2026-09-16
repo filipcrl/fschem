@@ -1,6 +1,5 @@
 """Native execution preparation, not a portable circuit compiler."""
 from pathlib import Path
-import json
 import re
 import shlex
 
@@ -64,10 +63,16 @@ def ngspice_inputs(deck: str, source: Path):
     endcs = [i for i, line in enumerate(lines) if line.strip().lower() == ".endc"]
     control = False
     count = 0
+    dot_count = 0
+    flow = False
     output = []
     for i, line in enumerate(lines):
         words = line.strip().lower().split()
         command = words[0] if words else ""
+        if not control and command.startswith(".") and command[1:] in _ANALYSES - {"run"}:
+            dot_count += 1
+        if control and command in {"while", "dowhile", "foreach", "repeat", "if", "goto"}:
+            flow = True
         if command == ".control":
             control = True
         if command == ".endc":
@@ -78,7 +83,11 @@ def ngspice_inputs(deck: str, source: Path):
         if control and command in _ANALYSES:
             output.append(f"write analysis-{count:04d}.raw")
             count += 1
-    return "\n".join(output) + "\n", files, count
+    if count and dot_count:
+        raise ValueError("native runner cannot combine dot-card and control analyses; use one style")
+    if count and flow:
+        raise ValueError("native runner cannot retain analyses inside control flow; use straight-line analyses")
+    return "\n".join(output) + "\n", files, max(count, dot_count)
 
 
 def vacask_config(source: Path):

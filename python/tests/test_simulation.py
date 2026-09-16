@@ -162,3 +162,112 @@ def test_real_native_divider(tmp_path, backend):
         if result.name == "Operating Point":
             np.testing.assert_allclose(result.voltage("vout" if backend == "ngspice" else "VOUT"), [2])
     assert fschem.Run.open(run.directory).status == "succeeded"
+
+
+def test_ngspice_nested_paths_local_startup_and_osdi(tmp_path):
+    source_dir = tmp_path / 'source with spaces'
+    source_dir.mkdir()
+    models = source_dir / 'model files'
+    models.mkdir()
+    (models / 'inner.inc').write_text('.param supply=3\n')
+    (models / 'outer.inc').write_text('.include "inner.inc"\n')
+    (models / 'sections.lib').write_text('.lib TT\n.param extra=1\n.endl TT\n')
+    (source_dir / '.spiceinit').write_text('set numdgt=9\n')
+    text = (ROOT / 'examples/spice.sch').read_text().replace('S {}', 'S {.include "model files/outer.inc"\n.lib "model files/sections.lib" TT}')
+    text = text.replace('name=V1 value=3}', 'name=V1 value={supply}}')
+    source = source_dir / 'divider.sch'
+    source.write_text(text)
+    sim = fschem.Simulation(fschem.Project(source_dir).load(source), mode='native')
+    p = sim.prepare(backend='ngspice')
+    assert p.files['.spiceinit'] == 'set numdgt=9\n'
+    assert '.lib "inputs/0002.inc" TT' in p.deck
+    assert '.lib TT' in p.files['inputs/0002.inc']
+    if shutil.which('ngspice'):
+        home = tmp_path / 'home'
+        home.mkdir()
+        run = p.run(directory=tmp_path / 'run', env={'HOME': str(home)}, timeout=30)
+        np.testing.assert_allclose(run.result('Operating Point').voltage('vout'), [2])
+    # Preparation resolves module paths without attempting to load/execute them.
+    (models / 'module.osdi').write_bytes(b'fixture')
+    (source_dir / '.spiceinit').write_text('osdi "model files/module.osdi"\n')
+    p = sim.prepare(backend='ngspice')
+    assert str(models / 'module.osdi') in p.files['.spiceinit']
+    (source_dir / '.spiceinit').write_text('osdi "$PDK/module.osdi"\n')
+    with pytest.raises(ValueError, match='dynamic native path'):
+        sim.prepare(backend='ngspice')
+
+
+def test_real_ngspice_control_multi_analysis(tmp_path):
+    if not shutil.which('ngspice'):
+        pytest.skip('ngspice not installed')
+    source = tmp_path / 'multi.sch'
+    source.write_text((ROOT / 'examples/spice.sch').read_text().replace('value=".op"', 'value=".control\nop\ntran 1n 10n\n.endc"'))
+    home = tmp_path / 'home'
+    home.mkdir()
+    sim = fschem.Simulation(fschem.Project(tmp_path).load(source), mode='native')
+    run = sim.run(backend='ngspice', directory=tmp_path / 'run', env={'HOME': str(home)}, timeout=30)
+    assert list(run.results) == ['analysis-0000.raw#0', 'analysis-0001.raw#0']
+    np.testing.assert_allclose(run.result('Operating Point').voltage('vout'), [2])
+    assert len(run.result('Transient Analysis').time) > 1
+
+
+def test_vacask_merged_local_config_and_relative_include(tmp_path):
+    import tomllib
+    source_dir = tmp_path / 'source with spaces'
+    source_dir.mkdir()
+    (source_dir / 'models').mkdir()
+    (source_dir / 'models' / 'supply.inc').write_text('parameters supply=3\n')
+    (source_dir / '.vacaskrc.toml').write_text('[Paths]\ninclude_path_prefix=["models"]\nmodule_path_suffix=["modules"]\n')
+    source = source_dir / 'divider.sch'
+    source.write_text((ROOT / 'examples/vacask.sch').read_text().replace('E {}', 'E {include "supply.inc"}').replace('vacask_params="dc=3 mag=1"', 'vacask_params="dc=supply mag=1"'))
+    p = fschem.Simulation(fschem.Project(source_dir).load(source), mode='native').prepare(backend='vacask')
+    config = tomllib.loads(p.files['vacask.toml'])
+    assert config['Paths']['include_path_prefix'] == [str(source_dir), str(source_dir / 'models')]
+    assert config['Paths']['module_path_suffix'] == [str(source_dir / 'modules')]
+    if shutil.which('vacask'):
+        run = p.run(directory=tmp_path / 'run', timeout=30)
+        assert run.manifest['execution']['argv'].count('--extra-tomlfile') == 1
+        np.testing.assert_allclose(run.result('Operating Point').voltage('VOUT'), [2])
+
+
+def test_reopen_rejects_escaping_paths_and_schema(tmp_path):
+    run = prepared().write(tmp_path / 'run')
+    data = run.manifest
+    data['artifacts']['deck'] = '../outside'
+    manifest = run.directory / 'run.json'
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='escapes'):
+        fschem.Run.open(run.directory)
+    data['schema_version'] = 999
+    manifest.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='schema_version'):
+        fschem.Run.open(run.directory)
+
+
+def test_native_control_flow_fails_closed(tmp_path):
+    for commands, message in [('.control\nrepeat 2\nop\nend\n.endc', 'control flow'),
+                              ('.op\n.control\ntran 1n 10n\n.endc', 'combine')]:
+        source = tmp_path / 'unsupported.sch'
+        source.write_text((ROOT / 'examples/spice.sch').read_text().replace('value=".op"', f'value="{commands}"'))
+        sim = fschem.Simulation(fschem.Project(tmp_path).load(source), mode='native')
+        with pytest.raises(ValueError, match=message):
+            sim.prepare(backend='ngspice')
+
+
+def test_duplicate_plot_names_remain_separate_and_missing_analyses_fail(tmp_path):
+    code = ''.join(f"Path({name!r}).write_text({RAW!r})\n" for name in ('op1.raw', 'op2.raw', 'op3.raw'))
+    run = prepared('vacask').run(directory=tmp_path / 'run', executable=fake(tmp_path, code))
+    assert len(run.results) == 3
+    assert run.result('op2').name == 'Operating Point'
+    with pytest.raises(KeyError, match='ambiguous'):
+        run.result('Operating Point')
+    with pytest.raises(fschem.SimulationError, match='incomplete'):
+        prepared('vacask').run(directory=tmp_path / 'partial', executable=success(tmp_path))
+
+
+def test_preexisting_raw_is_not_published(tmp_path):
+    run = prepared().write(tmp_path / 'run')
+    (run.directory / 'prior.raw').write_text(RAW)
+    with pytest.raises(fschem.SimulationError, match='already contains'):
+        run.execute(executable=success(tmp_path))
+    assert run.manifest['results'] == []
