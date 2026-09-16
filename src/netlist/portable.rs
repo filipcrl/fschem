@@ -217,6 +217,7 @@ pub fn elaborate(
         scopes: Vec::new(),
         ihp: false,
         signals: BTreeMap::new(),
+        node_owners: BTreeMap::new(),
     };
     let scope = resolve_parameters(&compiler.options.parameters, &BTreeMap::new())?;
     compiler.sheet(
@@ -310,8 +311,21 @@ struct Compiler {
     scopes: Vec<serde_json::Value>,
     ihp: bool,
     signals: BTreeMap<String, String>,
+    node_owners: BTreeMap<String, String>,
 }
 impl Compiler {
+    fn claim_node(&mut self, node: &str, owner: String) -> Result<(), String> {
+        let key = node.to_ascii_lowercase();
+        if let Some(previous) = self.node_owners.get(&key) {
+            if previous != &owner {
+                return Err(format!("portable node name collision: {previous} and {owner} emit {node}"));
+            }
+        } else {
+            self.node_owners.insert(key, owner);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn sheet(
         &mut self,
@@ -364,6 +378,9 @@ impl Compiler {
             } else {
                 format!("n{}", encoded(&format!("{path}/{net}")))
             };
+            if net != "0" && !connections.contains_key(&net.to_ascii_lowercase()) {
+                self.claim_node(&node, format!("{path}/{net}").to_ascii_lowercase())?;
+            }
             node_map.insert(net.to_ascii_lowercase(), node.clone());
             self.signals.insert(format!("{path}/{net}"), node);
         }
@@ -386,8 +403,23 @@ impl Compiler {
                 }
             }
         }
+        if path.is_empty() {
+            for node in node_map.values() {
+                if node != "0" {
+                    self.claim_node(node, format!("/{node}").to_ascii_lowercase())?;
+                }
+            }
+        }
         let mut names = BTreeSet::new();
         for c in &sheet.components {
+            for flag in ["spice_short", "spice_ignore", "vacask_ignore"] {
+                if c.flag(flag) {
+                    return Err(format!(
+                        "{path}/{}: backend-specific {flag} is unsupported in portable mode",
+                        c.value("name").unwrap_or("<unnamed>")
+                    ));
+                }
+            }
             if is_label(c.kind()) || c.kind() == "noconn" {
                 continue;
             }
@@ -412,26 +444,11 @@ impl Compiler {
                     "native code conflict at {instance} ({file_key}); exclude this exact block and migrate its parameters/analyses"
                 ));
             }
-            for flag in ["spice_short", "spice_ignore", "vacask_ignore"] {
-                if c.flag(flag) {
-                    return Err(format!(
-                        "{instance}: backend-specific {flag} is unsupported in portable mode"
-                    ));
-                }
-            }
             let mut nodes = Vec::new();
             for (i, _) in &c.pins {
                 let net = &sheet.pin_names[*i];
                 identifier(net)?;
-                let node = if net == "0" {
-                    "0".into()
-                } else if let Some(node) = connections.get(&net.to_ascii_lowercase()) {
-                    node.clone()
-                } else if path.is_empty() {
-                    net.clone()
-                } else {
-                    format!("n{}", encoded(&format!("{path}/{net}")))
-                };
+                let node = node_map[&net.to_ascii_lowercase()].clone();
                 self.signals.insert(format!("{path}/{net}"), node.clone());
                 nodes.push(node);
             }

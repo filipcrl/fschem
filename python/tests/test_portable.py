@@ -237,3 +237,27 @@ def test_controlled_voltage_and_current_source(tmp_path, backend, device):
     run = fschem.Simulation(c, mode='portable').op().run(
         backend=backend, directory=tmp_path / 'run', timeout=20, env={'HOME': str(tmp_path / 'home')})
     assert run.result('op').voltage('/OUT')[0] == pytest.approx(expected)
+
+
+@pytest.mark.parametrize('backend', ['ngspice', 'vacask'])
+def test_flattened_node_collision_rejected(tmp_path, backend):
+    symbol(tmp_path, 'cell', 'subcircuit', ['P'], 'name=X')
+    symbol(tmp_path, 'r', 'resistor', ['P', 'N'], 'name=R value=1 m=1')
+    symbol(tmp_path, 'port', 'ipin', ['P'], 'name=p lab=P')
+    tmp_path.joinpath('cell.sch').write_text(HEADER +
+        'C {r.sym} 0 0 0 0 {name=R}\n'
+        'C {port.sym} 0 0 0 0 {name=p lab=P}\nN 20 0 25 0 {lab=INNER}\n')
+    c = circuit(tmp_path, [('cell', 'name=X1', ['A']),
+        ('r', 'name=RROOT', ['n2f58312f494e4e4552', '0'])])
+    with pytest.raises(ValueError, match='node name collision'):
+        compile_raw(c, backend)
+
+
+@pytest.mark.parametrize('backend', ['ngspice', 'vacask'])
+@pytest.mark.parametrize('flag', ['spice_ignore', 'vacask_ignore', 'spice_short'])
+def test_label_backend_flags_rejected(tmp_path, backend, flag):
+    symbol(tmp_path, 'label', 'lab_pin', ['P'], 'name=p lab=A')
+    c = circuit(tmp_path, [('label', f'name=p {flag}=true', ['A']),
+                           ('label', 'name=q', ['B'])])
+    with pytest.raises(ValueError, match=f'backend-specific {flag}'):
+        compile_raw(c, backend)
