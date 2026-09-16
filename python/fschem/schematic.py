@@ -26,7 +26,8 @@ class Project:
 
     def __init__(self, root: PathInput = ".", *,
                  library_paths: Iterable[PathInput] = (),
-                 discover_libraries: bool = True):
+                 discover_libraries: bool = True, technology=None):
+        self.technology = technology
         self.root = Path(root).resolve()
         self.library_paths = tuple(self._resolve(p) for p in library_paths)
         self.discover_libraries = discover_libraries
@@ -70,6 +71,17 @@ class Schematic:
         if backend is not None:
             self.netlist(backend=backend)
         return self.diagnostics
+
+    def dump_ir(self, stage: str, *, backend: Backend = "ngspice", config=None) -> dict:
+        """Return a detached, versioned parsed/resolved/lowered snapshot.
+
+        Uses the same Rust stages as netlisting; never executes a simulator.
+        Portable config is accepted only for lowered snapshots.
+        """
+        import json
+        if config is not None and not isinstance(config, dict):
+            raise ValueError("IR config must be a mapping")
+        return json.loads(self._native.dump_ir(stage, backend, json.dumps(config or {}, allow_nan=False)))
 
     def netlist(self, *, backend: Backend = "ngspice") -> str:
         """Generate a legacy/native deck without writing files or running a simulator."""

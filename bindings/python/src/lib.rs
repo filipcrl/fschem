@@ -55,6 +55,67 @@ impl Schematic {
             .collect()
     }
 
+    fn portable(
+        &self,
+        py: Python<'_>,
+        backend: &str,
+        parameters: std::collections::BTreeMap<String, String>,
+        local_parameters: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, String>,
+        >,
+        exclude: std::collections::BTreeSet<String>,
+        sources: std::collections::BTreeMap<String, (String, Vec<String>, String)>,
+    ) -> PyResult<(
+        String,
+        bool,
+        std::collections::BTreeMap<String, String>,
+        String,
+    )> {
+        py.detach(|| {
+            let circuit = netlist::portable::compile(
+                &self.loaded.document,
+                self.loaded.path.as_ref().expect("opened source"),
+                self.paths.clone(),
+                backend,
+                netlist::portable::Options {
+                    parameters,
+                    local_parameters,
+                    exclude,
+                    sources,
+                },
+            )
+            .map_err(PyValueError::new_err)?;
+            let snapshot = netlist::lowered_snapshot(
+                &circuit,
+                self.loaded.path.as_ref().expect("opened source"),
+                backend,
+            )
+            .to_string();
+            Ok((circuit.deck, circuit.ihp, circuit.signals, snapshot))
+        })
+    }
+
+    fn dump_ir(
+        &self,
+        py: Python<'_>,
+        stage: &str,
+        backend: &str,
+        config: &str,
+    ) -> PyResult<String> {
+        py.detach(|| {
+            netlist::dump_ir(
+                &self.loaded.document,
+                self.loaded.path.as_ref().expect("opened source"),
+                self.paths.clone(),
+                stage,
+                backend,
+                config,
+            )
+            .map_err(PyValueError::new_err)
+        })
+    }
+
     fn netlist(&self, py: Python<'_>, backend: &str) -> PyResult<String> {
         py.detach(|| {
             let source = self

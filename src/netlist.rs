@@ -208,221 +208,10 @@ impl Exporter {
         if depth > 32 {
             return Err("subcircuit hierarchy exceeds 32 levels".into());
         }
-        if !doc.diagnostics.is_empty() {
-            return Err("document has parser diagnostics; resolve them before netlisting".into());
-        }
-        if source
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("sym"))
-        {
-            return Err("SPICE export requires a schematic, not a symbol".into());
-        }
-        let mut embedded = HashMap::new();
-        let mut last = None;
-        for record in &doc.records {
-            match &record.kind {
-                RecordKind::Instance { symbol, .. } => last = Some(symbol.clone()),
-                RecordKind::Embedded(records) => {
-                    if let Some(symbol) = &last {
-                        embedded
-                            .entry(symbol.clone())
-                            .or_insert_with(|| Arc::new(doc.embedded(records)));
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut points = Vec::new();
-        let mut wires = Vec::new();
-        let mut labels = Vec::new();
-        let mut components = Vec::new();
-        for record in &doc.records {
-            match &record.kind {
-                RecordKind::Wire { a, b, properties } => {
-                    let index = points.len();
-                    points.extend([*a, *b]);
-                    wires.push((index, index + 1));
-                    if let Some(label) = properties.get("lab") {
-                        labels.push((index, scalar(label)?.to_owned()));
-                    }
-                }
-                RecordKind::Instance {
-                    symbol,
-                    at,
-                    rotation,
-                    flip,
-                    properties,
-                } => {
-                    if properties.flag(if self.vacask {
-                        "vacask_ignore"
-                    } else {
-                        "spice_ignore"
-                    }) {
-                        continue;
-                    }
-                    let (definition, resolved) = if let Some(doc) = embedded.get(symbol) {
-                        (Arc::clone(doc), None)
-                    } else {
-                        let path = self
-                            .library
-                            .paths
-                            .resolve(
-                                symbol,
-                                source.parent().unwrap_or(Path::new(".")),
-                                doc.version() == "1.0",
-                            )
-                            .map_err(|e| format!("line {}: {e}", record.line))?;
-                        (self.library.document(&path)?, Some(path))
-                    };
-                    if !definition.diagnostics.is_empty() {
-                        return Err(format!(
-                            "line {}: symbol {symbol} has parser diagnostics",
-                            record.line
-                        ));
-                    }
-                    let metadata = definition.symbol_properties().cloned().unwrap_or_default();
-                    let defaults = Properties::parse(metadata.get("template").unwrap_or("").into());
-                    let mut component = Component {
-                        info: InstanceInfo {
-                            symbol: symbol.clone(),
-                            embedded: resolved.is_none(),
-                            resolved,
-                            source_file: source.to_owned(),
-                            definition: Some(Arc::clone(&definition)),
-                            at: *at,
-                            rotation: *rotation,
-                            flip: *flip,
-                            properties: properties.clone(),
-                            bounds: Bounds::new(*at, *at),
-                        },
-                        metadata,
-                        defaults,
-                        pins: Vec::new(),
-                        line: record.line,
-                    };
-                    if component.flag(if self.vacask {
-                        "vacask_ignore"
-                    } else {
-                        "spice_ignore"
-                    }) || matches!(component.kind(), "launcher" | "logo" | "netlist_options")
-                    {
-                        continue;
-                    }
-                    let transform = Transform::new(*at, *rotation, *flip);
-                    for pin in &definition.records {
-                        if let RecordKind::Rectangle {
-                            layer: 5,
-                            a,
-                            b,
-                            properties,
-                        } = &pin.kind
-                        {
-                            if properties.flag(if self.vacask {
-                                "vacask_ignore"
-                            } else {
-                                "spice_ignore"
-                            }) {
-                                continue;
-                            }
-                            let index = points.len();
-                            points.push(transform.point((*a + *b) * 0.5));
-                            component.pins.push((index, properties.clone()));
-                        }
-                    }
-                    if is_label(component.kind()) {
-                        let label = scalar(component.value("lab").ok_or_else(|| {
-                            format!("line {}: label has no lab attribute", record.line)
-                        })?)?
-                        .to_owned();
-                        let index = component.pins.first().map(|p| p.0).unwrap_or_else(|| {
-                            points.push(*at);
-                            points.len() - 1
-                        });
-                        labels.push((index, label));
-                    }
-                    components.push(component);
-                }
-                _ => {}
-            }
-        }
-        let mut nets = Nets::new(points.len());
-        // Pins and wire endpoints connect to segment interiors. Two crossing
-        // interiors alone do not connect (the Xschem four-way crossing rule).
-        let mut positions = HashMap::new();
-        for (i, point) in points.iter().enumerate() {
-            let key = (bits(point.x), bits(point.y));
-            if let Some(previous) = positions.insert(key, i) {
-                nets.join(i, previous);
-            }
-        }
-        let mut by_x: Vec<_> = (0..points.len()).collect();
-        let mut by_y = by_x.clone();
-        by_x.sort_by(|a, b| points[*a].x.total_cmp(&points[*b].x));
-        by_y.sort_by(|a, b| points[*a].y.total_cmp(&points[*b].y));
-        for &(a, b) in &wires {
-            nets.join(a, b);
-            let bounds = Bounds::new(points[a], points[b]);
-            let xs = by_x.partition_point(|i| points[*i].x < bounds.min.x)
-                ..by_x.partition_point(|i| points[*i].x <= bounds.max.x);
-            let ys = by_y.partition_point(|i| points[*i].y < bounds.min.y)
-                ..by_y.partition_point(|i| points[*i].y <= bounds.max.y);
-            let candidates = if xs.len() < ys.len() {
-                &by_x[xs]
-            } else {
-                &by_y[ys]
-            };
-            for &i in candidates {
-                if on_segment(points[i], points[a], points[b]) {
-                    nets.join(a, i);
-                }
-            }
-        }
-        let mut named = HashMap::new();
-        for (index, label) in &labels {
-            if let Some(previous) = named.insert(label.to_ascii_lowercase(), *index) {
-                nets.join(*index, previous);
-            }
-        }
-        let mut names = HashMap::new();
-        for (index, label) in &labels {
-            let root = nets.root(*index);
-            if let Some(previous) = names.insert(root, label.clone())
-                && !previous.eq_ignore_ascii_case(label)
-            {
-                return Err(format!(
-                    "conflicting labels {previous:?} and {label:?} on the same net"
-                ));
-            }
-        }
-        let mut number = 1;
-        for i in 0..points.len() {
-            names.entry(nets.root(i)).or_insert_with(|| {
-                loop {
-                    let name = format!("net{number}");
-                    number += 1;
-                    if !named.contains_key(&name) {
-                        break name;
-                    }
-                }
-            });
-        }
-        let pin_names: Vec<_> = (0..points.len())
-            .map(|i| names[&nets.root(i)].clone())
-            .collect();
-        if let Some(ports) = ports {
-            let actual: HashSet<_> = components
-                .iter()
-                .filter(|c| matches!(c.kind(), "ipin" | "opin" | "iopin"))
-                .filter_map(|c| c.value("lab"))
-                .map(str::to_ascii_lowercase)
-                .collect();
-            let expected: HashSet<_> = ports.iter().map(|p| p.to_ascii_lowercase()).collect();
-            if actual != expected {
-                return Err(format!(
-                    "symbol pins {ports:?} do not match schematic ports {actual:?}"
-                ));
-            }
-        }
+        let ResolvedSheet {
+            components,
+            pin_names,
+        } = resolve_sheet(&mut self.library, doc, source, ports, Some(self.vacask))?;
         let mut output = String::new();
         // Xschem's E block is the Spectre/native deck preamble; S is SPICE.
         if let Some(global) = doc.global(if self.vacask { 'E' } else { 'S' }) {
@@ -681,3 +470,254 @@ impl Nets {
         self.0[b] = a;
     }
 }
+
+/// Connectivity resolved once for native and portable lowering. Pin indices refer
+/// to pin_names; symbol templates remain distinct from instance properties.
+struct ResolvedSheet {
+    components: Vec<Component>,
+    pin_names: Vec<String>,
+}
+fn resolve_sheet(
+    library: &mut Library,
+    doc: &Document,
+    source: &Path,
+    ports: Option<&[String]>,
+    native: Option<bool>,
+) -> Result<ResolvedSheet, String> {
+    if !doc.diagnostics.is_empty() {
+        return Err("document has parser diagnostics; resolve them before netlisting".into());
+    }
+    if source
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("sym"))
+    {
+        return Err("SPICE export requires a schematic, not a symbol".into());
+    }
+    let mut embedded = HashMap::new();
+    let mut last = None;
+    for record in &doc.records {
+        match &record.kind {
+            RecordKind::Instance { symbol, .. } => last = Some(symbol.clone()),
+            RecordKind::Embedded(records) => {
+                if let Some(symbol) = &last {
+                    embedded
+                        .entry(symbol.clone())
+                        .or_insert_with(|| Arc::new(doc.embedded(records)));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut points = Vec::new();
+    let mut wires = Vec::new();
+    let mut labels = Vec::new();
+    let mut components = Vec::new();
+    for record in &doc.records {
+        match &record.kind {
+            RecordKind::Wire { a, b, properties } => {
+                let index = points.len();
+                points.extend([*a, *b]);
+                wires.push((index, index + 1));
+                if let Some(label) = properties.get("lab") {
+                    labels.push((index, scalar(label)?.to_owned()));
+                }
+            }
+            RecordKind::Instance {
+                symbol,
+                at,
+                rotation,
+                flip,
+                properties,
+            } => {
+                if native.is_some()
+                    && properties.flag(if native == Some(true) {
+                        "vacask_ignore"
+                    } else {
+                        "spice_ignore"
+                    })
+                {
+                    continue;
+                }
+                let (definition, resolved) = if let Some(doc) = embedded.get(symbol) {
+                    (Arc::clone(doc), None)
+                } else {
+                    let path = library
+                        .paths
+                        .resolve(
+                            symbol,
+                            source.parent().unwrap_or(Path::new(".")),
+                            doc.version() == "1.0",
+                        )
+                        .map_err(|e| format!("line {}: {e}", record.line))?;
+                    (library.document(&path)?, Some(path))
+                };
+                if !definition.diagnostics.is_empty() {
+                    return Err(format!(
+                        "line {}: symbol {symbol} has parser diagnostics",
+                        record.line
+                    ));
+                }
+                let metadata = definition.symbol_properties().cloned().unwrap_or_default();
+                let defaults = Properties::parse(metadata.get("template").unwrap_or("").into());
+                let mut component = Component {
+                    info: InstanceInfo {
+                        symbol: symbol.clone(),
+                        embedded: resolved.is_none(),
+                        resolved,
+                        source_file: source.to_owned(),
+                        definition: Some(Arc::clone(&definition)),
+                        at: *at,
+                        rotation: *rotation,
+                        flip: *flip,
+                        properties: properties.clone(),
+                        bounds: Bounds::new(*at, *at),
+                    },
+                    metadata,
+                    defaults,
+                    pins: Vec::new(),
+                    line: record.line,
+                };
+                if (native.is_some()
+                    && component.flag(if native == Some(true) {
+                        "vacask_ignore"
+                    } else {
+                        "spice_ignore"
+                    }))
+                    || matches!(component.kind(), "launcher" | "logo")
+                    || (native.is_some() && component.kind()=="netlist_options")
+                {
+                    continue;
+                }
+                let transform = Transform::new(*at, *rotation, *flip);
+                for pin in &definition.records {
+                    if let RecordKind::Rectangle {
+                        layer: 5,
+                        a,
+                        b,
+                        properties,
+                    } = &pin.kind
+                    {
+                        if native.is_none() && (properties.flag("spice_ignore") || properties.flag("vacask_ignore")) {
+                            return Err(format!("line {}: backend-specific pin ignore unsupported in portable connectivity",record.line));
+                        }
+                        if native.is_some()
+                            && properties.flag(if native == Some(true) {
+                                "vacask_ignore"
+                            } else {
+                                "spice_ignore"
+                            })
+                        {
+                            continue;
+                        }
+                        let index = points.len();
+                        points.push(transform.point((*a + *b) * 0.5));
+                        component.pins.push((index, properties.clone()));
+                    }
+                }
+                if is_label(component.kind()) {
+                    let label = scalar(component.value("lab").ok_or_else(|| {
+                        format!("line {}: label has no lab attribute", record.line)
+                    })?)?
+                    .to_owned();
+                    let index = component.pins.first().map(|p| p.0).unwrap_or_else(|| {
+                        points.push(*at);
+                        points.len() - 1
+                    });
+                    labels.push((index, label));
+                }
+                components.push(component);
+            }
+            _ => {}
+        }
+    }
+    let mut nets = Nets::new(points.len());
+    // Pins and wire endpoints connect to segment interiors. Two crossing
+    // interiors alone do not connect (the Xschem four-way crossing rule).
+    let mut positions = HashMap::new();
+    for (i, point) in points.iter().enumerate() {
+        let key = (bits(point.x), bits(point.y));
+        if let Some(previous) = positions.insert(key, i) {
+            nets.join(i, previous);
+        }
+    }
+    let mut by_x: Vec<_> = (0..points.len()).collect();
+    let mut by_y = by_x.clone();
+    by_x.sort_by(|a, b| points[*a].x.total_cmp(&points[*b].x));
+    by_y.sort_by(|a, b| points[*a].y.total_cmp(&points[*b].y));
+    for &(a, b) in &wires {
+        nets.join(a, b);
+        let bounds = Bounds::new(points[a], points[b]);
+        let xs = by_x.partition_point(|i| points[*i].x < bounds.min.x)
+            ..by_x.partition_point(|i| points[*i].x <= bounds.max.x);
+        let ys = by_y.partition_point(|i| points[*i].y < bounds.min.y)
+            ..by_y.partition_point(|i| points[*i].y <= bounds.max.y);
+        let candidates = if xs.len() < ys.len() {
+            &by_x[xs]
+        } else {
+            &by_y[ys]
+        };
+        for &i in candidates {
+            if on_segment(points[i], points[a], points[b]) {
+                nets.join(a, i);
+            }
+        }
+    }
+    let mut named = HashMap::new();
+    for (index, label) in &labels {
+        if let Some(previous) = named.insert(label.to_ascii_lowercase(), *index) {
+            nets.join(*index, previous);
+        }
+    }
+    let mut names = HashMap::new();
+    for (index, label) in &labels {
+        let root = nets.root(*index);
+        if let Some(previous) = names.insert(root, label.clone())
+            && !previous.eq_ignore_ascii_case(label)
+        {
+            return Err(format!(
+                "conflicting labels {previous:?} and {label:?} on the same net"
+            ));
+        }
+    }
+    let mut number = 1;
+    for i in 0..points.len() {
+        names.entry(nets.root(i)).or_insert_with(|| {
+            loop {
+                let name = format!("net{number}");
+                number += 1;
+                if !named.contains_key(&name) {
+                    break name;
+                }
+            }
+        });
+    }
+    let pin_names: Vec<_> = (0..points.len())
+        .map(|i| names[&nets.root(i)].clone())
+        .collect();
+    if let Some(ports) = ports {
+        let actual: HashSet<_> = components
+            .iter()
+            .filter(|c| matches!(c.kind(), "ipin" | "opin" | "iopin"))
+            .filter_map(|c| c.value("lab"))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let expected: HashSet<_> = ports.iter().map(|p| p.to_ascii_lowercase()).collect();
+        if expected.len()!=ports.len() {return Err("duplicate hierarchy interface pin names".into());}
+        if actual != expected {
+            return Err(format!(
+                "symbol pins {ports:?} do not match schematic ports {actual:?}"
+            ));
+        }
+    }
+    Ok(ResolvedSheet {
+        components,
+        pin_names,
+    })
+}
+
+mod expression;
+
+pub mod portable;
+
+mod inspection;
+pub use inspection::{dump_ir, lowered_snapshot};
