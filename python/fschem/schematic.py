@@ -72,6 +72,17 @@ class Schematic:
             self.netlist(backend=backend)
         return self.diagnostics
 
+    def dump_ir(self, stage: str, *, backend: Backend = "ngspice", config=None) -> dict:
+        """Return a detached, versioned parsed/resolved/lowered snapshot.
+
+        Uses the same Rust stages as netlisting; never executes a simulator.
+        Portable config is accepted only for lowered snapshots.
+        """
+        import json
+        if config is not None and not isinstance(config, dict):
+            raise ValueError("IR config must be a mapping")
+        return json.loads(self._native.dump_ir(stage, backend, json.dumps(config or {}, allow_nan=False)))
+
     def netlist(self, *, backend: Backend = "ngspice") -> str:
         """Generate a legacy/native deck without writing files or running a simulator."""
         return self._native.netlist(backend)

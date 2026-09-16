@@ -146,6 +146,23 @@ class Simulation:
         max_step = number(output_step if max_step is None else max_step, "max_step", positive=True)
         return self._analysis("tran", name, save, stop=stop, output_step=output_step, max_step=max_step)
 
+    def ac(self, **kwargs):
+        raise NotImplementedError("portable AC is not supported yet; use explicit native mode")
+
+    def dc(self, **kwargs):
+        raise NotImplementedError("portable DC sweeps are not supported yet; use with_parameters plus op, or native mode")
+
+    def dump_ir(self, *, backend: Backend = "ngspice") -> dict:
+        """Inspect the elaborated portable circuit without preparing or executing."""
+        if self.mode != "portable":
+            raise ValueError("lowered circuit inspection requires portable mode")
+        return self.circuit.dump_ir("lowered", backend=backend, config={
+            "parameters": dict(self.parameters),
+            "local_parameters": {k: dict(v) for k, v in self.local_parameters.items()},
+            "exclude": sorted(self.exclude),
+            "sources": {k: {"kind": v[0], "nodes": v[1], "value": v[2]} for k, v in self.sources.items()},
+        })
+
     def prepare(self, *, backend: Backend):
         if self.mode == "portable":
             from ._portable import prepare
@@ -392,6 +409,12 @@ class Run:
                                       "path": path.name, "plot_index": index, "sha256": _digest(path),
                                       "signals": list(result.signals),
                                       "signal_map": signal_map})
+            if data["mode"] == "portable":
+                expected = {a["name"]: a["kind"] for a in data["analyses"]["specifications"]}
+                actual = {r["analysis_name"]: r["name"] for r in published}
+                kinds = {"op": "Operating Point", "tran": "Transient Analysis"}
+                if len(published) != len(expected) or actual != {k: kinds[v] for k, v in expected.items()}:
+                    raise ValueError("portable simulator produced unexpected or incomplete named analyses")
             if len(published) < data["analyses"]["minimum_plots"]:
                 raise ValueError("simulator produced missing or incomplete raw analyses")
             data["results"] = published

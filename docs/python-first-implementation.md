@@ -50,3 +50,18 @@ One writer at a time per checkout/worktree. Reviewers are read-only. The user re
 | Integration | Main checkout, `master`, only after both writers finish | Merge both branches, resolve conflicts, run manifest/UI/Python launcher integration and docs | End-to-end tests then fresh parallel reviews | Sole writer after dependency barrier |
 
 Both lane worktrees are persistent local Git worktrees, allocated by the parent before launch. No child may edit another lane checkout. Read-only integration inputs remain at `/Users/filipcorlan/work/ihp-adc` and `/Users/filipcorlan/work/IHP-Open-PDK` (their relative locations differ in lane worktrees). Keep worktrees until parent acceptance; no automatic branch deletion. All child agents use medium thinking. Reviews run concurrently after integration and precede a single fix writer.
+
+## Approved IR inspection addition (user steering during portable lane)
+
+Add agent-friendly, read-only deterministic JSON snapshots for `parsed`, `resolved`
+and `lowered` stages. Each has `schema_version`, `stage`, `source`, stable IDs and
+source locations, ordered pins/terminals, identity and parameter/net information.
+Parsed inspection preserves lossless records; resolved inspection uses shared
+connectivity/hierarchy; lowered inspection exposes the actual elaborated circuit
+before deck serialization, not Debug output or a JSON-wrapped deck. Invalid
+options and unsupported stages fail clearly; inspection never launches engines.
+The core lane owns Rust/Python inspection, schema documentation and tests. The
+integration lane owns CLI dispatch in `main.rs`: `--dump-ir STAGE FILE.sch`,
+optional JSON portable preparation config, existing backend/library selection,
+JSON-only stdout (or explicit output file), diagnostics on stderr/nonzero status,
+no GUI initialization, help and CLI regression tests.

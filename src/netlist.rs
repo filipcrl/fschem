@@ -583,7 +583,8 @@ fn resolve_sheet(
                     } else {
                         "spice_ignore"
                     }))
-                    || matches!(component.kind(), "launcher" | "logo" | "netlist_options")
+                    || matches!(component.kind(), "launcher" | "logo")
+                    || (native.is_some() && component.kind()=="netlist_options")
                 {
                     continue;
                 }
@@ -596,6 +597,9 @@ fn resolve_sheet(
                         properties,
                     } = &pin.kind
                     {
+                        if native.is_none() && (properties.flag("spice_ignore") || properties.flag("vacask_ignore")) {
+                            return Err(format!("line {}: backend-specific pin ignore unsupported in portable connectivity",record.line));
+                        }
                         if native.is_some()
                             && properties.flag(if native == Some(true) {
                                 "vacask_ignore"
@@ -698,6 +702,7 @@ fn resolve_sheet(
             .map(str::to_ascii_lowercase)
             .collect();
         let expected: HashSet<_> = ports.iter().map(|p| p.to_ascii_lowercase()).collect();
+        if expected.len()!=ports.len() {return Err("duplicate hierarchy interface pin names".into());}
         if actual != expected {
             return Err(format!(
                 "symbol pins {ports:?} do not match schematic ports {actual:?}"
@@ -713,3 +718,6 @@ fn resolve_sheet(
 mod expression;
 
 pub mod portable;
+
+mod inspection;
+pub use inspection::{dump_ir, lowered_snapshot};

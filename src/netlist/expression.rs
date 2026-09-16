@@ -1,6 +1,7 @@
 //! Strict scalar expression tree. No simulator text substitution or evaluation.
 use std::collections::BTreeMap;
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", content = "arguments", rename_all = "snake_case")]
 pub enum Expr {
     Number(f64),
     Name(String),

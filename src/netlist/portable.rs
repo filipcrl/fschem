@@ -2,6 +2,174 @@
 use super::expression::Expr;
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
+#[derive(serde::Serialize, Clone)]
+pub struct Terminal {
+    pub name: String,
+    pub node: String,
+}
+#[derive(serde::Serialize)]
+pub struct Device {
+    pub id: String,
+    pub source: PathBuf,
+    pub line: Option<usize>,
+    pub symbol: Option<String>,
+    pub kind: String,
+    pub model: String,
+    pub emitted_name: String,
+    pub terminals: Vec<Terminal>,
+    pub expressions: BTreeMap<String, String>,
+    pub parameters: BTreeMap<String, f64>,
+    pub waveform: Option<Waveform>,
+    pub behavior: Option<Expr>,
+}
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Waveform {
+    Dc {
+        value: f64,
+    },
+    Pulse {
+        low: f64,
+        high: f64,
+        delay: f64,
+        rise: f64,
+        fall: f64,
+        width: f64,
+        period: f64,
+    },
+    Pwl {
+        points: Vec<[f64; 2]>,
+    },
+}
+impl Waveform {
+    fn emit(&self, vacask: bool) -> String {
+        match self {
+            Self::Dc { value } => {
+                if vacask {
+                    format!("dc={value:e}")
+                } else {
+                    format!("DC {value:e}")
+                }
+            }
+            Self::Pulse {
+                low,
+                high,
+                delay,
+                rise,
+                fall,
+                width,
+                period,
+            } => {
+                let args = [*low, *high, *delay, *rise, *fall, *width, *period];
+                if vacask {
+                    format!(
+                        "type=\"pulse\" {}",
+                        ["val0", "val1", "delay", "rise", "fall", "width", "period"]
+                            .iter()
+                            .zip(args)
+                            .map(|(k, v)| format!("{k}={v:e}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                } else {
+                    format!(
+                        "PULSE({})",
+                        args.iter()
+                            .map(|v| format!("{v:e}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )
+                }
+            }
+            Self::Pwl { points } => {
+                let values = points
+                    .iter()
+                    .flatten()
+                    .map(|v| format!("{v:e}"))
+                    .collect::<Vec<_>>();
+                if vacask {
+                    format!("type=\"pwl\" wave=[{}]", values.join(", "))
+                } else {
+                    format!("PWL({})", values.join(" "))
+                }
+            }
+        }
+    }
+}
+/// The same elaborated records drive inspection and deck serialization.
+fn emit(devices: &[Device], vacask: bool) -> String {
+    let mut models = BTreeSet::new();
+    let mut body = String::new();
+    for d in devices {
+        let nodes = d
+            .terminals
+            .iter()
+            .map(|t| t.node.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let name = &d.emitted_name;
+        if let Some(expr) = &d.behavior {
+            let value = emit_behavior(expr);
+            append(
+                &mut body,
+                &if vacask {
+                    format!("{name} ({nodes}) v={value}")
+                } else {
+                    format!("{name} {nodes} V={value}")
+                },
+            );
+            continue;
+        }
+        let wrapper = name.starts_with('x');
+        let params = if let Some(w) = &d.waveform {
+            w.emit(vacask)
+        } else if !vacask && !wrapper {
+            format!("{:e}", d.parameters.values().next().unwrap())
+        } else {
+            d.parameters
+                .iter()
+                .map(|(k, v)| format!("{k}={v:e}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        if vacask {
+            let model = if wrapper {
+                d.model.clone()
+            } else {
+                let model = &d.model;
+                models.insert(format!(
+                    "{}model fschem_{model} {model}",
+                    if matches!(model.as_str(), "resistor" | "capacitor" | "inductor") {
+                        format!("load \"{model}.osdi\"\n")
+                    } else {
+                        String::new()
+                    }
+                ));
+                format!("fschem_{model}")
+            };
+            append(&mut body, &format!("{name} ({nodes}) {model} {params}"));
+        } else {
+            append(
+                &mut body,
+                &format!(
+                    "{name} {nodes}{}{params}",
+                    if wrapper {
+                        format!(" {} ", d.model)
+                    } else {
+                        " ".into()
+                    }
+                ),
+            );
+        }
+    }
+    format!(
+        "{}{body}",
+        models
+            .into_iter()
+            .map(|m| format!("{m}\n"))
+            .collect::<String>()
+    )
+}
 
 #[derive(Default)]
 pub struct Options {
@@ -16,8 +184,21 @@ pub struct Circuit {
     pub deck: String,
     pub ihp: bool,
     pub signals: BTreeMap<String, String>,
+    pub devices: Vec<Device>,
+    pub scopes: Vec<serde_json::Value>,
 }
 pub fn compile(
+    doc: &Document,
+    source: &Path,
+    paths: LibraryPaths,
+    backend: &str,
+    options: Options,
+) -> Result<Circuit, String> {
+    let mut circuit = elaborate(doc, source, paths, backend, options)?;
+    circuit.deck = emit(&circuit.devices, backend == "vacask");
+    Ok(circuit)
+}
+pub fn elaborate(
     doc: &Document,
     source: &Path,
     paths: LibraryPaths,
@@ -32,9 +213,8 @@ pub fn compile(
         options,
         used_exclusions: BTreeSet::new(),
         used_scopes: BTreeSet::new(),
-        models: BTreeSet::new(),
-        body: String::new(),
-        vacask: backend == "vacask",
+        devices: Vec::new(),
+        scopes: Vec::new(),
         ihp: false,
         signals: BTreeMap::new(),
     };
@@ -61,19 +241,17 @@ pub fn compile(
             return Err(format!("unknown local parameter scope {key}"));
         }
     }
-    let deck = format!(
-        "{}{}",
-        compiler
-            .models
-            .into_iter()
-            .map(|s| format!("{s}\n"))
-            .collect::<String>(),
-        compiler.body
-    );
+    compiler.devices.sort_by(|a, b| a.id.cmp(&b.id));
+    compiler
+        .scopes
+        .sort_by_key(|s| s["id"].as_str().unwrap().to_owned());
+    let deck = String::new();
     Ok(Circuit {
         deck,
         ihp: compiler.ihp,
         signals: compiler.signals,
+        devices: compiler.devices,
+        scopes: compiler.scopes,
     })
 }
 fn identifier(value: &str) -> Result<&str, String> {
@@ -127,9 +305,8 @@ struct Compiler {
     options: Options,
     used_exclusions: BTreeSet<String>,
     used_scopes: BTreeSet<String>,
-    models: BTreeSet<String>,
-    body: String,
-    vacask: bool,
+    devices: Vec<Device>,
+    scopes: Vec<serde_json::Value>,
     ihp: bool,
     signals: BTreeMap<String, String>,
 }
@@ -170,6 +347,9 @@ impl Compiler {
             scope = resolve_parameters(locals, &scope)?;
             self.used_scopes.insert(scope_path.into());
         }
+        self.scopes.push(serde_json::json!({"id":scope_path,"source":source,"effective_parameters":scope,
+            "interface_parameters":interface,"local_definitions":self.options.local_parameters.get(scope_path),
+            "experiment_definitions":if path.is_empty(){Some(&self.options.parameters)}else{None}}));
         let sheet = resolve_sheet(&mut self.library, doc, source, ports, None)?;
         let mut node_map = BTreeMap::from([("0".into(), "0".into())]);
         for net in &sheet.pin_names {
@@ -330,6 +510,11 @@ impl Compiler {
                         overrides.insert(key.clone(), eval(value, &scope)?);
                     }
                 }
+                let interface_defaults = defaults.clone();
+                let instance_overrides = defaults
+                    .keys()
+                    .filter_map(|k| c.info.properties.get(k).map(|v| (k.clone(), v.to_owned())))
+                    .collect::<BTreeMap<_, _>>();
                 // Defaults are defined in their own scope; instance expressions use the caller scope.
                 for (key, value) in overrides {
                     defaults.insert(key, format!("{value:e}"));
@@ -351,7 +536,15 @@ impl Compiler {
                     child,
                     &interface,
                     depth + 1,
-                )
+                )?;
+                let scope = self
+                    .scopes
+                    .iter_mut()
+                    .find(|v| v["id"] == instance)
+                    .unwrap();
+                scope["interface_defaults"] = serde_json::json!(interface_defaults);
+                scope["instance_overrides"] = serde_json::json!(instance_overrides);
+                Ok(())
             } else {
                 self.device(c, &nodes, &instance, &scope, &node_map)
             };
@@ -378,21 +571,28 @@ impl Compiler {
                 if nodes[0] == nodes[1] {
                     return Err("supplemental source terminals must differ".into());
                 }
-                let params = waveform(value, &scope, self.vacask)?;
-                let name = format!("{prefix}{}", encoded(key));
-                if self.vacask {
-                    let model = if prefix == 'v' { "vsource" } else { "isource" };
-                    self.models.insert(format!("model fschem_{model} {model}"));
-                    append(
-                        &mut self.body,
-                        &format!("{name} ({}) fschem_{model} {params}", nodes.join(" ")),
-                    );
-                } else {
-                    append(
-                        &mut self.body,
-                        &format!("{name} {} {params}", nodes.join(" ")),
-                    );
-                }
+                let model = if prefix == 'v' { "vsource" } else { "isource" };
+                self.devices.push(Device {
+                    id: key.clone(),
+                    source: source.into(),
+                    line: None,
+                    symbol: None,
+                    kind: model.into(),
+                    model: model.into(),
+                    emitted_name: format!("{prefix}{}", encoded(key)),
+                    terminals: ["P", "N"]
+                        .iter()
+                        .zip(nodes)
+                        .map(|(p, n)| Terminal {
+                            name: (*p).into(),
+                            node: n,
+                        })
+                        .collect(),
+                    parameters: BTreeMap::new(),
+                    expressions: BTreeMap::from([("value".into(), value.clone())]),
+                    waveform: Some(waveform(value, &scope)?),
+                    behavior: None,
+                });
             }
         }
         Ok(())
@@ -405,10 +605,79 @@ impl Compiler {
         scope: &BTreeMap<String, f64>,
         node_map: &BTreeMap<String, String>,
     ) -> Result<(), String> {
-        let value = |key: &str| -> Result<f64, String> {
-            eval(c.value(key).ok_or_else(|| format!("missing {key}"))?, scope)
+        let value = |key: &str| eval(c.value(key).ok_or_else(|| format!("missing {key}"))?, scope);
+        let mut device = Device {
+            id: path.into(),
+            source: c.info.source_file.clone(),
+            line: Some(c.line),
+            symbol: Some(c.info.symbol.clone()),
+            kind: c.kind().into(),
+            model: String::new(),
+            emitted_name: String::new(),
+            terminals: c
+                .pins
+                .iter()
+                .zip(nodes)
+                .map(|((_, p), n)| Terminal {
+                    name: p.get("name").unwrap_or("").into(),
+                    node: n.clone(),
+                })
+                .collect(),
+            parameters: BTreeMap::new(),
+            expressions: BTreeMap::new(),
+            waveform: None,
+            behavior: None,
         };
-        if c.kind() == "source" {
+        for key in ["value", "w", "l", "ng", "m", "mm_ok", "FUNC"] {
+            if let Some(text) = c.value(key) {
+                device.expressions.insert(key.into(), text.into());
+            }
+        }
+        let sym = c.symname();
+        let ihp = matches!(sym.as_str(), "sg13_lv_nmos" | "sg13_lv_pmos")
+            && matches!(c.kind(), "nmos" | "pmos");
+        let prefix = if ihp {
+            if c.value("spiceprefix")
+                .is_some_and(|s| !s.eq_ignore_ascii_case("x"))
+            {
+                return Err("IHP requires subcircuit wrapper prefix X".into());
+            }
+            if value("ng")?.fract() != 0. {
+                return Err("IHP ng must be an integer".into());
+            }
+            if c.value("model") != Some(sym.as_str()) {
+                return Err("IHP symbol/model mismatch".into());
+            }
+            if nodes.len() != 4 {
+                return Err("IHP requires four terminals".into());
+            }
+            let mut ordered = Vec::new();
+            for pin in ["D", "G", "S", "B"] {
+                let found = device
+                    .terminals
+                    .iter()
+                    .filter(|t| t.name.eq_ignore_ascii_case(pin))
+                    .collect::<Vec<_>>();
+                if found.len() != 1 {
+                    return Err(format!("IHP requires unique named {pin} terminal"));
+                }
+                ordered.push(Terminal {
+                    name: pin.into(),
+                    node: found[0].node.clone(),
+                });
+            }
+            device.terminals = ordered;
+            for key in ["w", "l", "ng", "m", "mm_ok"] {
+                let v = value(key)?;
+                if (key == "mm_ok" && ![0., 1.].contains(&v)) || (key != "mm_ok" && v <= 0.) {
+                    return Err(format!("invalid IHP {key}"));
+                }
+                device.parameters.insert(key.into(), v);
+            }
+            self.ihp = true;
+            device.model = sym;
+            'x'
+        } else if c.kind() == "source" {
             if c.value("VAR") != Some("V")
                 || nodes.len() != 2
                 || c.value("m")
@@ -421,61 +690,13 @@ impl Compiler {
                     "only unity-multiplicity behavioral voltage sources are supported".into(),
                 );
             }
-            let expr = Expr::parse(c.value("FUNC").ok_or("missing behavioral FUNC")?)?;
-            let value = behavior(&expr, scope, node_map)?;
-            let name = format!("b{}", encoded(path));
-            let line = if self.vacask {
-                format!("{name} ({}) v={value}", nodes.join(" "))
-            } else {
-                format!("{name} {} V={value}", nodes.join(" "))
-            };
-            append(&mut self.body, &line);
-            return Ok(());
-        }
-        let sym = c.symname();
-        let ihp = matches!(sym.as_str(), "sg13_lv_nmos" | "sg13_lv_pmos")
-            && matches!(c.kind(), "nmos" | "pmos");
-        let (prefix, model, params, mut nodes) = if ihp {
-            if c.value("spiceprefix")
-                .is_some_and(|s| !s.eq_ignore_ascii_case("x"))
-            {
-                return Err("IHP requires subcircuit wrapper prefix X".into());
-            }
-            if value("ng")?.fract() != 0. {
-                return Err("IHP ng must be an integer".into());
-            }
-            if c.value("model") != Some(sym.as_str()) {
-                return Err("IHP symbol/model mismatch".into());
-            }
-            let mut ordered = Vec::new();
-            for pin in ["D", "G", "S", "B"] {
-                let indices = c
-                    .pins
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (_, p))| {
-                        p.get("name").is_some_and(|n| n.eq_ignore_ascii_case(pin))
-                    })
-                    .map(|(i, _)| i)
-                    .collect::<Vec<_>>();
-                if indices.len() != 1 {
-                    return Err(format!("IHP requires unique named {pin} terminal"));
-                }
-                ordered.push(nodes[indices[0]].clone());
-            }
-            if nodes.len() != 4 {
-                return Err("IHP requires four terminals".into());
-            }
-            let mut params = Vec::new();
-            for key in ["w", "l", "ng", "m", "mm_ok"] {
-                let v = value(key)?;
-                if (key == "mm_ok" && ![0., 1.].contains(&v)) || (key != "mm_ok" && v <= 0.) {
-                    return Err(format!("invalid IHP {key}"));
-                }
-                params.push(format!("{key}={v:e}"));
-            }
-            self.ihp = true;
-            ('x', sym, params.join(" "), ordered)
+            device.behavior = Some(lower_behavior(
+                &Expr::parse(c.value("FUNC").ok_or("missing behavioral FUNC")?)?,
+                scope,
+                node_map,
+            )?);
+            device.model = "behavioral_voltage".into();
+            'b'
         } else {
             let (prefix, model, parameter) = match c.kind() {
                 "resistor" => ('r', "resistor", "r"),
@@ -497,12 +718,11 @@ impl Compiler {
             if c.value("device_model").is_some_and(|v| !v.is_empty()) {
                 return Err("custom device_model requires an explicit technology binding".into());
             }
-            let params = if prefix == 'v' || prefix == 'i' {
-                waveform(
+            if matches!(prefix, 'v' | 'i') {
+                device.waveform = Some(waveform(
                     c.value("value").ok_or("missing source value")?,
                     scope,
-                    self.vacask,
-                )?
+                )?);
             } else {
                 let mut v = value("value")?;
                 if prefix != 'e' {
@@ -516,39 +736,16 @@ impl Compiler {
                     }
                     v = if prefix == 'c' { v * m } else { v / m };
                 }
-                if self.vacask {
-                    format!("{parameter}={v:e}")
-                } else {
-                    format!("{v:e}")
+                if !v.is_finite() {
+                    return Err("non-finite effective device value".into());
                 }
-            };
-            if self.vacask {
-                self.models.insert(format!(
-                    "{}model fschem_{model} {model}",
-                    if matches!(prefix, 'r' | 'c' | 'l') {
-                        format!("load \"{model}.osdi\"\n")
-                    } else {
-                        String::new()
-                    }
-                ));
+                device.parameters.insert(parameter.into(), v);
             }
-            (prefix, format!("fschem_{model}"), params, nodes.to_vec())
+            device.model = model.into();
+            prefix
         };
-        let name = format!("{prefix}{}", encoded(path));
-        if self.vacask {
-            append(
-                &mut self.body,
-                &format!("{name} ({}) {model} {params}", nodes.join(" ")),
-            );
-        } else {
-            if ihp {
-                nodes.push(model);
-            }
-            append(
-                &mut self.body,
-                &format!("{name} {} {params}", nodes.join(" ")),
-            );
-        }
+        device.emitted_name = format!("{prefix}{}", encoded(path));
+        self.devices.push(device);
         Ok(())
     }
 }
@@ -558,11 +755,11 @@ fn root_name(path: &str) -> Result<&str, String> {
         .ok_or("supplemental paths must start with /")?;
     identifier(name).map_err(|_| format!("supplemental sources require root-only paths: {path}"))
 }
-fn behavior(
+fn lower_behavior(
     expr: &Expr,
     scope: &BTreeMap<String, f64>,
     nodes: &BTreeMap<String, String>,
-) -> Result<String, String> {
+) -> Result<Expr, String> {
     Ok(match expr {
         Expr::Voltage(a, b) => {
             let node = |s: &str| {
@@ -571,28 +768,38 @@ fn behavior(
                     .cloned()
                     .ok_or_else(|| format!("undefined behavioral voltage node {s}"))
             };
-            let a = node(a)?;
-            if let Some(b) = b {
-                format!("v({a},{})", node(b)?)
-            } else {
-                format!("v({a})")
-            }
+            Expr::Voltage(node(a)?, b.as_ref().map(|b| node(b)).transpose()?)
         }
-        Expr::Unary(op, v) => format!("({op}{})", behavior(v, scope, nodes)?),
+        Expr::Unary(op, v) => Expr::Unary(*op, Box::new(lower_behavior(v, scope, nodes)?)),
         Expr::Binary(op, a, b) => {
             if *op == '^' {
                 return Err("behavioral powers unsupported".into());
             }
-            format!(
-                "({} {op} {})",
-                behavior(a, scope, nodes)?,
-                behavior(b, scope, nodes)?
+            Expr::Binary(
+                *op,
+                Box::new(lower_behavior(a, scope, nodes)?),
+                Box::new(lower_behavior(b, scope, nodes)?),
             )
         }
-        _ => format!("{:e}", expr.evaluate(scope)?),
+        _ => Expr::Number(expr.evaluate(scope)?),
     })
 }
-fn waveform(text: &str, scope: &BTreeMap<String, f64>, vacask: bool) -> Result<String, String> {
+fn emit_behavior(expr: &Expr) -> String {
+    match expr {
+        Expr::Voltage(a, b) => {
+            if let Some(b) = b {
+                format!("v({a},{b})")
+            } else {
+                format!("v({a})")
+            }
+        }
+        Expr::Unary(op, v) => format!("({op}{})", emit_behavior(v)),
+        Expr::Binary(op, a, b) => format!("({} {op} {})", emit_behavior(a), emit_behavior(b)),
+        Expr::Number(v) => format!("{v:e}"),
+        Expr::Name(_) => unreachable!("lowered expressions contain no unresolved parameters"),
+    }
+}
+fn waveform(text: &str, scope: &BTreeMap<String, f64>) -> Result<Waveform, String> {
     let text = text.trim();
     let upper = text.to_ascii_uppercase();
     for kind in ["PULSE", "PWL"] {
@@ -634,17 +841,15 @@ fn waveform(text: &str, scope: &BTreeMap<String, f64>, vacask: bool) -> Result<S
                 if parts[2..].iter().any(|v| *v < 0.) || parts[6] <= 0. {
                     return Err("invalid PULSE timing".into());
                 }
-                if vacask {
-                    return Ok(format!(
-                        "type=\"pulse\" {}",
-                        ["val0", "val1", "delay", "rise", "fall", "width", "period"]
-                            .iter()
-                            .zip(parts)
-                            .map(|(k, v)| format!("{k}={v:e}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    ));
-                }
+                return Ok(Waveform::Pulse {
+                    low: parts[0],
+                    high: parts[1],
+                    delay: parts[2],
+                    rise: parts[3],
+                    fall: parts[4],
+                    width: parts[5],
+                    period: parts[6],
+                });
             } else {
                 if parts.len() < 4 || parts.len() % 2 != 0 {
                     return Err("PWL requires time/value pairs".into());
@@ -653,25 +858,10 @@ fn waveform(text: &str, scope: &BTreeMap<String, f64>, vacask: bool) -> Result<S
                 if times[0] < 0. || times.windows(2).any(|w| w[1] <= w[0]) {
                     return Err("PWL times must strictly increase".into());
                 }
-                if vacask {
-                    return Ok(format!(
-                        "type=\"pwl\" wave=[{}]",
-                        parts
-                            .iter()
-                            .map(|v| format!("{v:e}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
+                return Ok(Waveform::Pwl {
+                    points: parts.chunks_exact(2).map(|p| [p[0], p[1]]).collect(),
+                });
             }
-            return Ok(format!(
-                "{kind}({})",
-                parts
-                    .iter()
-                    .map(|v| format!("{v:e}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ));
         }
     }
     let text = if upper.starts_with("DC ") {
@@ -680,12 +870,9 @@ fn waveform(text: &str, scope: &BTreeMap<String, f64>, vacask: bool) -> Result<S
         text
     };
     let v = eval(text, scope)?;
-    Ok(if vacask {
-        format!("dc={v:e}")
-    } else {
-        format!("DC {v:e}")
-    })
+    Ok(Waveform::Dc { value: v })
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,17 +880,19 @@ mod tests {
     fn waveforms() {
         let scope = BTreeMap::from([("T".into(), 1e-9)]);
         assert!(
-            waveform("PULSE(0 1 {2*T} 1p 1p {T} {4*T})", &scope, true)
+            waveform("PULSE(0 1 {2*T} 1p 1p {T} {4*T})", &scope)
                 .unwrap()
+                .emit(true)
                 .contains("period=4e-9")
         );
         assert!(
-            waveform("PWL(0 0 1n 1)", &scope, true)
+            waveform("PWL(0 0 1n 1)", &scope)
                 .unwrap()
+                .emit(true)
                 .contains("wave=[")
         );
         for s in ["SIN(0 1 1k)", "PWL(1 0 0 1)", "PULSE(0 1)"] {
-            assert!(waveform(s, &scope, false).is_err());
+            assert!(waveform(s, &scope).is_err());
         }
     }
     #[test]

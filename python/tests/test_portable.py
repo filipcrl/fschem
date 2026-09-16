@@ -60,6 +60,13 @@ def test_hierarchy_defaults_overrides_and_locals(tmp_path):
     text = compile_raw(c, parameters={'TOP': '3k'}, locals=locals)
     assert ' A 0 7e3' in text
     assert ' B 0 4e3' in text
+    ir = c.dump_ir('lowered', config={'parameters': {'TOP': '3k'}, 'local_parameters': locals})
+    x1 = next(s for s in ir['scopes'] if s['id'] == '/X1')
+    assert x1['interface_defaults'] == {'a': '1k', 'b': '2*a'}
+    assert x1['instance_overrides'] == {'a': '{TOP}'}
+    assert x1['effective_parameters'] == {'a': 3000., 'b': 6000., 'extra': 1000.}
+    resolved = c.dump_ir('resolved')
+    assert any(s['id'] == '/X1' and s['ports'] == ['P'] for s in resolved['sheets'])
     with pytest.raises(ValueError, match='shadow'):
         compile_raw(c, parameters={'TOP': '3k'}, locals={'/X1': {'a': '2k'}})
     with pytest.raises(ValueError, match='undefined'):
@@ -82,6 +89,9 @@ def test_ihp_named_pins_and_symbol_defaults(tmp_path, backend, polarity):
     assert 'DRAIN GATE SOURCE BULK' in text
     assert model in text and 'ng=2e0' in text and 'm=3e0' in text and 'mm_ok=1e0' in text
     assert text.startswith('x')
+    ir = c.dump_ir('lowered', backend=backend)
+    assert [t['name'] for t in ir['devices'][0]['terminals']] == ['D', 'G', 'S', 'B']
+    assert ir['devices'][0]['parameters']['mm_ok'] == 1
     c = circuit(tmp_path, [(model, 'name=M mm_ok=0 m=4 ng=5', ['BULK', 'SOURCE', 'DRAIN', 'GATE'])])
     text = compile_raw(c, backend)
     assert 'mm_ok=0e0' in text and 'm=4e0' in text and 'ng=5e0' in text
@@ -175,3 +185,17 @@ def test_prepare_guards():
         s.prepare(backend='ngspice')
     with pytest.raises(ValueError, match='duplicate'):
         s.op()
+
+
+@pytest.mark.parametrize('backend', ['ngspice', 'vacask'])
+def test_per_analysis_saves(tmp_path, backend):
+    if not shutil.which(backend):
+        pytest.skip('engine unavailable')
+    c = fschem.Project(ROOT, discover_libraries=False).load('examples/portable.sch')
+    sim = fschem.Simulation(c, mode='portable', parameters={'R': '10k', 'VDD': 3})
+    sim.op(name='output', save=['/VOUT']).op(name='input', save=['/VIN'])
+    (tmp_path / 'home').mkdir()
+    run = sim.run(backend=backend, directory=tmp_path / 'run', env={'HOME': str(tmp_path / 'home')}, timeout=20)
+    assert run.result('output').voltage('/VOUT')[0] == pytest.approx(2)
+    assert run.result('input').voltage('/VIN')[0] == pytest.approx(3)
+    assert '/VIN' not in run.result('output').signal_map
