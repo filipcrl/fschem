@@ -4,7 +4,9 @@ use pyo3::{exceptions::PyValueError, prelude::*};
 use std::path::PathBuf;
 
 type Diagnostic = (String, usize, String);
-type RawVariable = (String, String, Vec<f64>, Vec<f64>);
+type RawVariable = (String, String, String, String, Vec<f64>, Vec<f64>);
+type ExpressionVariable = (String, String, Vec<f64>, Vec<f64>);
+type Calculated = (String, String, Vec<f64>, Vec<f64>);
 type RawPlot = (String, String, bool, Option<usize>, Vec<RawVariable>);
 
 #[pyclass(module = "fschem._core")]
@@ -16,20 +18,24 @@ struct Schematic {
 #[pymethods]
 impl Schematic {
     #[new]
+    #[pyo3(signature = (path, library_paths, discover, variables=None))]
     fn new(
         py: Python<'_>,
         path: PathBuf,
         library_paths: Vec<PathBuf>,
         discover: bool,
+        variables: Option<std::collections::HashMap<String,String>>,
     ) -> PyResult<Self> {
         py.detach(move || {
-            let paths = if discover {
+            let mut paths = if discover {
                 LibraryPaths::discover(library_paths)
             } else {
                 LibraryPaths {
                     roots: library_paths,
+                    ..Default::default()
                 }
             };
+            paths.variables = variables.unwrap_or_default();
             let loaded =
                 LoadedDocument::open(&path, paths.clone()).map_err(PyValueError::new_err)?;
             Ok(Self { loaded, paths })
@@ -152,7 +158,7 @@ fn read_raw(py: Python<'_>, path: PathBuf) -> PyResult<Vec<RawPlot>> {
                         .map(|v| {
                             let (real, imaginary) =
                                 v.values.into_iter().map(|s| (s.real, s.imaginary)).unzip();
-                            (v.name, v.kind, real, imaginary)
+                            (v.name, v.kind, v.native_kind, v.unit, real, imaginary)
                         })
                         .collect(),
                 )
@@ -161,9 +167,47 @@ fn read_raw(py: Python<'_>, path: PathBuf) -> PyResult<Vec<RawPlot>> {
     })
 }
 
+#[pyfunction]
+fn calculate(py: Python<'_>, expression: String, variables: Vec<ExpressionVariable>, scale: Option<usize>) -> PyResult<Calculated> {
+    py.detach(move || {
+        let points = variables.first().map(|v| v.2.len()).unwrap_or(0);
+        if points == 0 || variables.iter().any(|v| v.2.len() != points || v.3.len() != points) || scale.is_some_and(|i| i >= variables.len()) {
+            return Err(PyValueError::new_err("invalid expression dataset dimensions/scale"));
+        }
+        // The evaluator's RawPlot scale convention is the first variable. Reorder
+        // vectors here rather than silently differentiating against another signal.
+        let mut variables = variables;
+        if let Some(index) = scale { variables.swap(0, index); }
+        let plot = fschem::raw::RawPlot {
+            title: "Python expression".into(),
+            name: if scale.is_some() { "Sweep" } else { "Operating Point" }.into(),
+            complex: true, points,
+            variables: variables.into_iter().map(|(name,kind,real,imag)| fschem::raw::Variable {
+                name, unit: fschem::units::Unit::parse(&kind).label, native_kind: kind.clone(), kind,
+                values: real.into_iter().zip(imag).map(|(real,imaginary)| fschem::raw::Sample { real,imaginary }).collect(),
+            }).collect(),
+        };
+        let result = fschem::units::calculate(&plot, &expression).map_err(PyValueError::new_err)?;
+        let (real, imaginary) = result.values.into_iter().map(|s| (s.real,s.imaginary)).unzip();
+        Ok((result.kind,result.unit,real,imaginary))
+    })
+}
+
+#[pyfunction]
+fn unit(kind: &str) -> String { fschem::units::Unit::parse(kind).label }
+
+#[pyfunction]
+fn project_config(start: PathBuf, explicit: Option<PathBuf>, disabled: bool) -> PyResult<String> {
+    let config = fschem::config::ProjectConfig::load(&start, explicit.as_deref(), disabled).map_err(PyValueError::new_err)?;
+    serde_json::to_string(&config).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Schematic>()?;
     m.add_function(wrap_pyfunction!(read_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(calculate, m)?)?;
+    m.add_function(wrap_pyfunction!(unit, m)?)?;
+    m.add_function(wrap_pyfunction!(project_config, m)?)?;
     Ok(())
 }

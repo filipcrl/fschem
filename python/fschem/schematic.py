@@ -1,4 +1,5 @@
 """Ordinary Python wrappers over the private Rust document implementation."""
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from os import PathLike
@@ -26,18 +27,32 @@ class Project:
 
     def __init__(self, root: PathInput = ".", *,
                  library_paths: Iterable[PathInput] = (),
-                 discover_libraries: bool = True, technology=None):
-        self.technology = technology
-        self.root = Path(root).resolve()
-        self.library_paths = tuple(self._resolve(p) for p in library_paths)
+                 discover_libraries: bool = True, technology=None,
+                 config: PathInput | Literal[False] | None = None):
+        self.root = Path(root).expanduser().resolve()
+        if config is True:
+            raise ValueError("config must be a path, None for discovery, or False to disable")
+        explicit = None if config is None or config is False else Path(config).expanduser()
+        self.config = json.loads(_core.project_config(self.root, explicit, config is False))
+        self.config_path = Path(self.config["path"]) if self.config["path"] else None
+        self.library_paths = tuple(self._resolve(p) for p in library_paths) + tuple(Path(p) for p in self.config["library_paths"])
         self.discover_libraries = discover_libraries
+        self.technology = technology
+        if technology is None and self.config["pdk_root"] and self.config["pdk"] == "ihp-sg13g2":
+            from .technology import IHP
+            self.technology = IHP(self.config["pdk_root"])
+        self._variables = {}
+        if self.config["pdk_root"]:
+            self._variables["PDK_ROOT"] = self.config["pdk_root"]
+        if self.config["pdk"]:
+            self._variables["PDK"] = self.config["pdk"]
 
     def _resolve(self, path: PathInput) -> Path:
-        return (self.root / path).resolve()
+        return (self.root / Path(path).expanduser()).resolve()
 
     def load(self, path: PathInput) -> "Schematic":
         source = self._resolve(path)
-        native = _core.Schematic(source, list(self.library_paths), self.discover_libraries)
+        native = _core.Schematic(source, list(self.library_paths), self.discover_libraries, self._variables)
         return Schematic(self, source, native)
 
 

@@ -16,7 +16,10 @@ def project():
     if not all(os.environ.get(n) for n in names):
         pytest.skip('set explicit IHP/ADC/Xschem integration paths')
     pdk, adc, devices = [Path(os.environ[n]).resolve() for n in names]
-    return fschem.Project(adc / 'schem', discover_libraries=False,
+    # This fixture exercises the explicit native-to-portable migration recipe,
+    # not the already migrated active ihp-adc experiment factory.
+    source = adc / 'legacy/schem' if (adc / 'legacy/schem').is_dir() else adc / 'schem'
+    return fschem.Project(source, discover_libraries=False, config=False,
         library_paths=[pdk / 'ihp-sg13g2/libs.tech/xschem', devices], technology=fschem.IHP(pdk))
 
 

@@ -301,6 +301,12 @@ class Run:
             if result.name != item["name"] or list(result.signals) != item["signals"]:
                 raise ValueError("raw metadata differs from manifest")
             result.signal_map = MappingProxyType(dict(item["signal_map"]))
+            if self._manifest["mode"] == "portable":
+                kinds, units = dict(result.kinds), dict(result.units)
+                for canonical, native in result.signal_map.items():
+                    if canonical.startswith("/") and kinds[native] == "notype":
+                        kinds[native], units[native] = "voltage", "V"
+                result.kinds, result.units = MappingProxyType(kinds), MappingProxyType(units)
             results[item["id"]] = result
         if not results:
             raise ValueError("successful run has no results")

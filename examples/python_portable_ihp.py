@@ -1,5 +1,6 @@
-"""Portable experiments using an external IHP PDK and ihp-adc schematics.
+"""Explicit migration recipe for native ihp-adc schematics (legacy/schem).
 
+Already-portable active sheets use ihp-adc/experiments.py, without exclusions.
 No inputs are modified. Pass absolute external paths; use --prepare-only for ADC.
 See docs/portable.md for the explicit native-code migration choices.
 """
@@ -41,7 +42,7 @@ def experiment(project, circuit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pdk", type=Path, required=True, help="IHP-Open-PDK root")
-    parser.add_argument("--schematics", type=Path, required=True, help="ihp-adc/schem")
+    parser.add_argument("--schematics", type=Path, required=True, help="ihp-adc/legacy/schem (native snapshot)")
     parser.add_argument("--devices", type=Path, required=True, help="Xschem devices symbol library")
     parser.add_argument("--backend", choices=["ngspice", "vacask"], required=True)
     parser.add_argument("--circuit", choices=["inverter", "adc"], default="inverter")
@@ -49,7 +50,7 @@ def main():
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--home", type=Path, help="explicit simulator HOME (optional clean startup)")
     args = parser.parse_args()
-    project = fschem.Project(args.schematics, discover_libraries=False,
+    project = fschem.Project(args.schematics, discover_libraries=False, config=False,
         library_paths=[args.pdk.resolve() / "ihp-sg13g2/libs.tech/xschem", args.devices.resolve()],
         technology=fschem.IHP(args.pdk))
     prepared = experiment(project, args.circuit).prepare(backend=args.backend)

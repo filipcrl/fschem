@@ -206,6 +206,7 @@ C {devices/code_shown.sym} 200 0 0 0 {name=SIM value=.op}
         Path::new("divider.sch"),
         LibraryPaths {
             roots: vec![root.into()],
+            ..Default::default()
         },
     )
     .unwrap();

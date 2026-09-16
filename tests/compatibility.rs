@@ -58,6 +58,7 @@ fn local_symbols_win_and_library_bare_names_resolve_with_spaces_in_paths() {
     );
     let paths = LibraryPaths {
         roots: vec![fixture.0.join("library")],
+        ..Default::default()
     };
     let loaded = LoadedDocument::open(&document, paths).unwrap();
     assert!(loaded.scene.diagnostics.is_empty());
@@ -198,6 +199,7 @@ fn installed_library_scenes() {
     let root = fs::canonicalize(root).unwrap();
     let paths = LibraryPaths {
         roots: vec![root.clone()],
+        ..Default::default()
     };
     let mut files = Vec::new();
     visit(&root, &mut files);

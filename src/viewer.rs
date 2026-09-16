@@ -909,6 +909,9 @@ pub struct Viewer {
     last_file_check: Instant,
 }
 impl Viewer {
+    pub(crate) fn set_simulator(&mut self, simulator: fschem::simulation::Simulator) {
+        self.simulator = simulator;
+    }
     pub fn new(ctx: &egui::Context, options: Options, smoke_success: Arc<AtomicBool>) -> Self {
         ctx.set_visuals(egui::Visuals::dark());
         let (sender, receiver) = mpsc::channel();

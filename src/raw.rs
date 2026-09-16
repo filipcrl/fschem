@@ -11,14 +11,17 @@ pub struct Sample {
     pub imaginary: f64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Variable {
     pub name: String,
+    /// Effective type; native metadata remains available separately.
     pub kind: String,
+    pub native_kind: String,
+    pub unit: String,
     pub values: Vec<Sample>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RawPlot {
     pub title: String,
     pub name: String,
@@ -27,13 +30,35 @@ pub struct RawPlot {
     pub variables: Vec<Variable>,
 }
 impl RawPlot {
+    /// VACASK raw files omit units. Infer only recognized electrical conventions;
+    /// arbitrary untyped vectors stay unknown (never infer from their values).
+    pub fn resolve_types(&mut self) {
+        let vacask = self.variables.iter().all(|v| v.native_kind.eq_ignore_ascii_case("notype"))
+            && self.variables.iter().any(|v| v.name.contains(":flow("));
+        let transient = self.name.to_ascii_lowercase().contains("transient");
+        let ac = self.name.to_ascii_lowercase().contains("ac") || self.name.to_ascii_lowercase().contains("frequency");
+        for v in &mut self.variables {
+            if !v.kind.eq_ignore_ascii_case("notype") {
+                v.unit = crate::units::Unit::parse(&v.kind).label;
+                continue;
+            }
+            let name = v.name.to_ascii_lowercase();
+            v.kind = if transient && name == "time" { "time" }
+                else if ac && name == "frequency" { "frequency" }
+                else if (name.starts_with("v(") && name.ends_with(')')) ||
+                    (vacask && !name.contains(['(', ')', '@']) && !name.ends_with(":noi")) { "voltage" }
+                else if (name.starts_with("i(") && name.ends_with(')')) || name.ends_with("#branch") || name.ends_with(":flow(br)") { "current" }
+                else { "notype" }.into();
+            v.unit = crate::units::Unit::parse(&v.kind).label;
+        }
+    }
     /// Operating-point files contain signals, not a sweep axis.
     pub fn scale(&self) -> Option<usize> {
         (!self.name.to_ascii_lowercase().contains("operating point")).then_some(0)
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RawFile {
     pub plots: Vec<RawPlot>,
 }
@@ -203,6 +228,8 @@ impl Reader<'_> {
             variables.push(Variable {
                 name: fields[1].into(),
                 kind: fields[2].into(),
+                native_kind: fields[2].into(),
+                unit: String::new(),
                 values: Vec::new(),
             });
         }
@@ -257,19 +284,31 @@ impl Reader<'_> {
                 variable.values.push(Sample { real, imaginary });
             }
         }
-        Ok(RawPlot {
+        let mut plot = RawPlot {
             title: title.ok_or("missing Title")?,
             name: name.ok_or("missing Plotname")?,
             complex,
             points,
             variables,
-        })
+        };
+        plot.resolve_types();
+        Ok(plot)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vacask_units_preserve_native_metadata_and_internal_unknowns() {
+        let raw = RawFile::parse(b"Title: test\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 5\nNo. Points: 1\nVariables:\n0 time notype\n1 OUT notype\n2 VDD:flow(br) notype\n3 x1:noi notype\n4 x1:flow(noii) notype\nValues:\n0 0\n1\n0.001\n0\n0\n").unwrap();
+        let v = &raw.plots[0].variables;
+        assert_eq!(v.iter().map(|v|v.unit.as_str()).collect::<Vec<_>>(), ["s","V","A","?","?"]);
+        assert!(v.iter().all(|v|v.native_kind == "notype"));
+        let raw = RawFile::parse(b"Title: unknown producer\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 2\nNo. Points: 1\nVariables:\n0 time notype\n1 mystery notype\nValues:\n0 0\n1\n").unwrap();
+        assert_eq!(raw.plots[0].variables[1].unit, "?");
+    }
 
     fn header(flags: &str, points: usize, section: &str) -> String {
         format!(

@@ -18,6 +18,7 @@ required-features = ["gui"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.9"
 eframe = { version = "0.33.3", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 rfd = { version = "0.15", optional = true }
 earcutr = { version = "0.4", optional = true }

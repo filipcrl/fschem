@@ -29,6 +29,8 @@ pub fn read_document(path: &Path) -> Result<Arc<Document>, String> {
 #[derive(Clone, Debug, Default)]
 pub struct LibraryPaths {
     pub roots: Vec<PathBuf>,
+    /// Project-local resolver variables, never exported to the process.
+    pub variables: HashMap<String, String>,
 }
 impl LibraryPaths {
     pub fn discover(explicit: Vec<PathBuf>) -> Self {
@@ -86,7 +88,7 @@ impl LibraryPaths {
         default_extension: Option<&str>,
         kind: &str,
     ) -> Result<PathBuf, String> {
-        let mut reference = expand_environment(reference, |name| env::var(name).ok())?;
+        let mut reference = expand_environment(reference, |name| self.variables.get(name).cloned().or_else(|| env::var(name).ok()))?;
         if reference.starts_with("~/") {
             let home = env::var_os("HOME")
                 .or_else(|| env::var_os("USERPROFILE"))

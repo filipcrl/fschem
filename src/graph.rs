@@ -92,7 +92,7 @@ impl Trace {
         let units = match mode {
             Mode::Phase => "degrees",
             Mode::Decibels => "dB",
-            _ => unit(&variable.kind),
+            _ => variable.unit.as_str(),
         };
         Self {
             index,
@@ -119,6 +119,9 @@ pub(crate) struct Display {
     plot: usize,
     selected: Vec<bool>,
     filter: String,
+    expression: String,
+    expression_error: Option<String>,
+    calculated: Vec<(String, String)>,
     mode: Mode,
     log_x: bool,
     fit: bool,
@@ -134,8 +137,16 @@ pub(crate) struct Display {
     omitted: usize,
 }
 impl Display {
-    pub(crate) fn new(path: PathBuf, raw: RawFile) -> Self {
+    pub(crate) fn new(path: PathBuf, mut raw: RawFile) -> Self {
         let aliases = artifact_aliases(&path, &raw);
+        for (plot, aliases) in raw.plots.iter_mut().zip(&aliases) {
+            for variable in &mut plot.variables {
+                if variable.kind == "notype" && aliases.iter().any(|(canonical,native)| canonical.starts_with('/') && canonical != native && native == &variable.name) {
+                    variable.kind = "voltage".into();
+                    variable.unit = "V".into();
+                }
+            }
+        }
         let mut result = Self {
             aliases: Arc::new(aliases),
             path,
@@ -143,6 +154,9 @@ impl Display {
             plot: 0,
             selected: Vec::new(),
             filter: String::new(),
+            expression: String::new(),
+            expression_error: None,
+            calculated: Vec::new(),
             mode: Mode::Real,
             log_x: false,
             fit: true,
@@ -172,6 +186,20 @@ impl Display {
         result.dirty = false;
         result
     }
+    fn add_expression(&mut self, expression: &str) -> Result<(), String> {
+        let plot = &self.raw.plots[self.plot];
+        if plot.variables.iter().any(|v| v.name == expression) {
+            return Err("This signal/expression already exists".into());
+        }
+        let variable = fschem::units::calculate_with_aliases(plot, expression, &self.aliases[self.plot])?;
+        self.calculated.push((plot.name.clone(), expression.into()));
+        Arc::make_mut(&mut self.raw).plots[self.plot].variables.push(variable);
+        self.selected.push(true);
+        self.dirty = true;
+        self.fit = true;
+        self.last_filter = "\0".into();
+        Ok(())
+    }
     pub(crate) fn open_plot(&mut self, index: usize) -> Result<(), String> {
         if index >= self.raw.plots.len() { return Err("Published plot is missing from raw file".into()); }
         self.plot = index;
@@ -182,6 +210,13 @@ impl Display {
     }
     /// Keep signal selection and navigation when the underlying file is replaced.
     pub(crate) fn restore_view(&mut self, previous: &Self) {
+        for (name, expression) in &previous.calculated {
+            if let Some(index) = self.raw.plots.iter().position(|p| &p.name == name) {
+                self.plot = index;
+                self.select_plot();
+                if let Err(error) = self.add_expression(expression) { self.expression_error = Some(error); }
+            }
+        }
         let old = &previous.raw.plots[previous.plot];
         self.plot = self
             .raw
@@ -290,7 +325,7 @@ impl Display {
         let plot = &self.raw.plots[self.plot];
         let x_unit = plot
             .scale()
-            .map(|i| unit(&plot.variables[i].kind))
+            .map(|i| plot.variables[i].unit.as_str())
             .unwrap_or("");
         draw_x_axis(&painter, area, x, x_unit, self.log_x);
         let clip = painter.with_clip_rect(area.intersect(painter.clip_rect()));
@@ -392,6 +427,17 @@ impl Display {
                 ui.label("Preparing traces…");
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Expression:");
+            let response = ui.add(egui::TextEdit::singleline(&mut self.expression)
+                .hint_text("v(OUT)/v(IN), v(OUT)/i(VDD), deriv(v(OUT))")
+                .desired_width(360.));
+            if ui.button("Add trace").clicked() || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                let expression = self.expression.trim().to_owned();
+                self.expression_error = self.add_expression(&expression).err();
+            }
+        });
+        if let Some(error) = &self.expression_error { ui.colored_label(Color32::LIGHT_RED, error); }
         ui.weak(&self.raw.plots[self.plot].title);
         ui.weak("Wheel to zoom X · right-drag/middle-drag to pan · Fit resets · hover for interpolated values");
         if self.omitted > 0 {
@@ -451,7 +497,7 @@ impl Display {
                             for row in rows {
                                 let index = self.filtered[row];
                                 let variable = &plot.variables[index];
-                                let label = format!("{} [{}]", signal_label(&variable.name, &self.aliases[self.plot]), unit(&variable.kind));
+                                let label = format!("{} [{}]", signal_label(&variable.name, &self.aliases[self.plot]), variable.unit);
                                 if ui.checkbox(&mut self.selected[index], label).changed() {
                                     self.dirty = true;
                                     self.fit = true;
@@ -723,7 +769,7 @@ impl Display {
             );
             let x_unit = data
                 .scale()
-                .map(|i| unit(&data.variables[i].kind))
+                .map(|i| data.variables[i].unit.as_str())
                 .unwrap_or("");
             draw_x_axis(
                 painter,
@@ -803,7 +849,7 @@ impl Display {
         match self.mode {
             Mode::Phase => "deg",
             Mode::Decibels => "dB",
-            _ => unit(&variable.kind),
+            _ => variable.unit.as_str(),
         }
     }
     fn group_bounds(&self, group: &[usize]) -> (f64, f64) {
@@ -1365,15 +1411,6 @@ fn draw_trace(
     }
 }
 
-fn unit(kind: &str) -> &str {
-    match kind {
-        "voltage" => "V",
-        "current" => "A",
-        "time" => "s",
-        "frequency" => "Hz",
-        _ => kind,
-    }
-}
 fn trace_color(index: usize) -> Color32 {
     const COLORS: [Color32; 6] = [
         Color32::LIGHT_GREEN,

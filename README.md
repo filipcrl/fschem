@@ -532,6 +532,14 @@ Extend property editing and connectivity-aware tools on top of the command
 history, and continue using existing Xschem projects as compatibility fixtures.
 
 
+## Project configuration and waveform units
+
+fschem automatically loads the nearest `.fschem.toml` for project library paths,
+scoped PDK variables and the default simulator. See [project configuration](docs/project-config.md).
+Long expanded schematic fields are [elided for display only](docs/field-display.md).
+Waveform results preserve native type metadata and show electrical units;
+[calculated traces](docs/waveform-units.md) propagate units such as V/V, Ω and W.
+
 ## Python experiments and artifact inspection
 
 The installable headless Python package supports native ngspice/VACASK runs and a

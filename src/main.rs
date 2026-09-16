@@ -12,7 +12,7 @@ mod waveforms;
 
 use fschem::{
     document::DiagnosticKind,
-    library::{LibraryPaths, read_document},
+    library::read_document,
 };
 use std::{
     path::{Path, PathBuf},
@@ -37,6 +37,8 @@ fn run() -> Result<(), String> {
     let mut dump_ir = None;
     let mut ir_config = None;
     let mut ir_output = None;
+    let mut project_config_path = None;
+    let mut no_config = false;
     let mut roots = Vec::new();
     let mut check = false;
     let mut open_as_text = false;
@@ -53,13 +55,15 @@ fn run() -> Result<(), String> {
         match arg.to_str() {
             Some("--help" | "-h") => {
                 println!(
-                    "fschem [OPTIONS] [FILE.sch|FILE.sym|TEXT]\n\n  -L, --library DIR  Add a symbol library search path (repeatable)\n  --netlist OUTPUT  Export a netlist without opening a window\n  --netlist-format FORMAT\n                   Netlist format: spice (default) or vacask\n  --simulate RAW   Run FILE.sch headlessly; save .raw, netlist and .log files\n  --simulator NAME Backend for --simulate/--dump-ir: ngspice (default) or vacask\n  --dump-ir STAGE  Inspect parsed/resolved/lowered IR as JSON (no GUI)\n  --ir-config FILE Portable lowering JSON config\n  --output FILE    Write IR JSON to a fresh file instead of stdout\n  --check PATH...   Check file syntax and lossless retention; recurse through directories\n  --verbose        Show all parser diagnostics in check mode\n  --open-run PATH  Inspect a Python run directory/manifest; never execute\n  --open-text      Open any file as read-only text (including .sch)\n  --smoke-test     Open, render three frames, then exit (demo if no file given)\n  --screenshot PNG Capture the egui window after loading\n\nCtrl/Command-O opens; Ctrl/Command-S saves; Ctrl/Command-Z undoes; Ctrl/Command-Shift-Z redoes.\nClick/Shift-click or left-drag selects; G moves; C copies; W wires; Backspace deletes.\nR/X/Y rotate or mirror while moving; left-click places; Esc cancels.\nMiddle/right-drag pans; wheel/pinch zooms; F fits. i: symbol, e: schematic, Shift-E: up.\nFile → Export SPICE netlist exports the current schematic.\nThe stroke font is built in. Source schematic files change only when saved."
+                    "fschem [OPTIONS] [FILE.sch|FILE.sym|TEXT]\n\n  -L, --library DIR  Add a symbol library search path (repeatable)\n  --config FILE     Use an explicit project TOML (default: nearest .fschem.toml)\n  --no-config       Disable project configuration discovery\n  --netlist OUTPUT  Export a netlist without opening a window\n  --netlist-format FORMAT\n                   Netlist format: spice (default) or vacask\n  --simulate RAW   Run FILE.sch headlessly; save .raw, netlist and .log files\n  --simulator NAME Backend for --simulate/--dump-ir: ngspice or vacask (project default)\n  --dump-ir STAGE  Inspect parsed/resolved/lowered IR as JSON (no GUI)\n  --ir-config FILE Portable lowering JSON config\n  --output FILE    Write IR JSON to a fresh file instead of stdout\n  --check PATH...   Check file syntax and lossless retention; recurse through directories\n  --verbose        Show all parser diagnostics in check mode\n  --open-run PATH  Inspect a Python run directory/manifest; never execute\n  --open-text      Open any file as read-only text (including .sch)\n  --smoke-test     Open, render three frames, then exit (demo if no file given)\n  --screenshot PNG Capture the egui window after loading\n\nCtrl/Command-O opens; Ctrl/Command-S saves; Ctrl/Command-Z undoes; Ctrl/Command-Shift-Z redoes.\nClick/Shift-click or left-drag selects; G moves; C copies; W wires; Backspace deletes.\nR/X/Y rotate or mirror while moving; left-click places; Esc cancels.\nMiddle/right-drag pans; wheel/pinch zooms; F fits. i: symbol, e: schematic, Shift-E: up.\nFile → Export SPICE netlist exports the current schematic.\nThe stroke font is built in. Source schematic files change only when saved."
                 );
                 return Ok(());
             }
             Some("--library" | "-L") => roots.push(PathBuf::from(
                 args.next().ok_or("--library requires a directory")?,
             )),
+            Some("--config") => project_config_path = Some(PathBuf::from(args.next().ok_or("--config requires a file")?)),
+            Some("--no-config") => no_config = true,
             Some("--dump-ir") => dump_ir = Some(args.next().ok_or("--dump-ir requires a stage")?.to_string_lossy().into_owned()),
             Some("--ir-config") => ir_config = Some(PathBuf::from(args.next().ok_or("--ir-config requires a file")?)),
             Some("--output") => ir_output = Some(PathBuf::from(args.next().ok_or("--output requires a file")?)),
@@ -127,6 +131,15 @@ fn run() -> Result<(), String> {
             _ => inputs.push(PathBuf::from(arg)),
         }
     }
+    if no_config && project_config_path.is_some() { return Err("--config and --no-config are mutually exclusive".into()); }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let start = inputs.first().or(open_run.as_ref()).unwrap_or(&cwd);
+    let project_config = fschem::config::ProjectConfig::load(start, project_config_path.as_deref(), no_config)?;
+    let libraries = project_config.libraries(roots, true)?;
+    let effective_simulator = simulator.unwrap_or(match project_config.simulator.as_deref() {
+        Some("vacask") => fschem::simulation::Simulator::Vacask,
+        _ => fschem::simulation::Simulator::Ngspice,
+    });
     if let Some(stage) = dump_ir {
         if check || open_as_text || open_run.is_some() || netlist.is_some() || simulate.is_some() || smoke_test || screenshot.is_some() || inputs.len() != 1 || netlist_format.is_some() {
             return Err("--dump-ir requires one schematic and cannot be combined with other actions".into());
@@ -136,11 +149,11 @@ fn run() -> Result<(), String> {
             Some(path) => std::fs::read_to_string(path).map_err(|e| e.to_string())?,
             None => "{}".into(),
         };
-        let backend = match simulator.unwrap_or_default() {
+        let backend = match effective_simulator {
             fschem::simulation::Simulator::Ngspice => "ngspice",
             fschem::simulation::Simulator::Vacask => "vacask",
         };
-        let json = fschem::netlist::dump_ir(&*read_document(&input)?, &input, LibraryPaths::discover(roots), &stage, backend, &config)?;
+        let json = fschem::netlist::dump_ir(&*read_document(&input)?, &input, libraries, &stage, backend, &config)?;
         if let Some(output) = ir_output {
             protect_source(&input, &output)?;
             if let Some(config) = ir_config { protect_source(&std::fs::canonicalize(config).map_err(|e| e.to_string())?, &output)?; }
@@ -176,7 +189,6 @@ fn run() -> Result<(), String> {
         let input = std::fs::canonicalize(&inputs[0])
             .map_err(|e| format!("{}: {e}", inputs[0].display()))?;
         let doc = read_document(&input)?;
-        let libraries = LibraryPaths::discover(roots);
         if let Some(output) = netlist {
             protect_source(&input, &output)?;
             let format = netlist_format.unwrap_or_default();
@@ -198,7 +210,7 @@ fn run() -> Result<(), String> {
                 output.display()
             );
         } else if let Some(output) = simulate {
-            let simulator = simulator.unwrap_or_default();
+            let simulator = effective_simulator;
             for path in [
                 output.clone(),
                 output.with_extension("log"),
@@ -238,7 +250,7 @@ fn run() -> Result<(), String> {
         input: inputs.pop(),
         open_as_text,
         open_run: is_open_run,
-        libraries: LibraryPaths::discover(roots),
+        libraries,
         smoke_test,
         screenshot,
     };
@@ -254,7 +266,8 @@ fn run() -> Result<(), String> {
             ..Default::default()
         },
         Box::new(move |cc| {
-            let viewer = viewer::Viewer::new(&cc.egui_ctx, options, app_success);
+            let mut viewer = viewer::Viewer::new(&cc.egui_ctx, options, app_success);
+            viewer.set_simulator(effective_simulator);
             #[cfg(target_os = "macos")]
             let viewer = {
                 let mut viewer = viewer;
