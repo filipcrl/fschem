@@ -40,6 +40,8 @@ pub enum EditOperation {
     Copy(Placement),
     Delete,
     Wire { start: Point, end: Point },
+    SetInstanceProperty { key: String, value: String },
+    SetRecordProperty { key: String, value: String },
 }
 
 /// A command prepares its result; the receiver installs it before history changes.
@@ -70,6 +72,8 @@ impl EditCommand for DocumentCommand {
             EditOperation::Copy(_) => "Copy",
             EditOperation::Delete => "Delete",
             EditOperation::Wire { .. } => "Add wire",
+            EditOperation::SetInstanceProperty { .. }
+            | EditOperation::SetRecordProperty { .. } => "Edit property",
         }
     }
     fn execute(&mut self) -> Result<&EditState, String> {
@@ -92,6 +96,20 @@ impl EditCommand for DocumentCommand {
                 }
                 EditOperation::Wire { start, end } => {
                     state.document = Arc::new(state.document.with_wire(start, end)?);
+                }
+                EditOperation::SetRecordProperty { ref key, ref value } => {
+                    state.document = Arc::new(state.document.with_record_property(
+                        &state.selection,
+                        key,
+                        value,
+                    )?);
+                }
+                EditOperation::SetInstanceProperty { ref key, ref value } => {
+                    state.document = Arc::new(state.document.with_instance_property(
+                        &state.selection,
+                        key,
+                        value,
+                    )?);
                 }
             }
             self.after = Some(state);

@@ -386,11 +386,13 @@ impl Builder {
                             .get("flags")
                             .is_some_and(|v| v.contains("graph") || v.contains("image"))
                     {
-                        self.warn(
-                            file,
-                            record.line,
-                            "waveform/image rectangle preserved; displaying its boundary only",
-                        );
+                        if properties.get("flags").is_some_and(|v| v.contains("image")) {
+                            self.warn(
+                                file,
+                                record.line,
+                                "image rectangle preserved; displaying its boundary only",
+                            );
+                        }
                         style.fill = Fill::None;
                     }
                     let mut closed = true;

@@ -58,16 +58,48 @@ verification so far has been on macOS.
 - Select an instance and press **i** to view its symbol, including embedded
   definitions. **e** opens its schematic; **Shift-E** returns one level up.
   Double-click and the inspector's Symbol/Schematic buttons use the same actions.
-- One application-level navigation stack is shared by symbol and schematic
-  descent. Each successful transition pushes the parent view; Shift-E pops
+- Files open in separate tabs, each with its own symbol/schematic navigation
+  stack. Tab labels show the hierarchy (for example `adc_tb>adc`) and `*` marks
+  edited frames. Each successful transition pushes the parent view; Shift-E pops
   exactly one frame and restores its viewport, layer visibility and selection.
   There is no eight-entry history cutoff. Failed descents do not push a frame,
   and going up cancels an in-flight child load. The toolbar shows the stack depth.
 - Original-source preview and compatibility diagnostics. Missing/cyclic/generated
   symbols are indicated in the drawing instead of silently disappearing.
 - Export SPICE decks from the current schematic, including subcircuit hierarchy.
-- Run ngspice from the toolbar and save raw simulation data, netlist, and log.
-- Plot ngspice raw data in a separate native waveform window using `egui_plot`.
+- Choose ngspice or VACASK from the Simulator menu and run from the ▶ toolbar button.
+- Plot ngspice raw data in a native waveform window or schematic graph rectangles,
+  using a shared peak-preserving renderer with automatic file refresh.
+
+### Command-line netlisting and simulation
+
+Both modes run without opening a window. With an installed `fschem` binary:
+
+```sh
+# Generate SPICE (default) or native VACASK netlists:
+fschem --netlist divider.spice examples/spice.sch
+fschem --netlist-format spice --netlist divider.spice examples/spice.sch
+fschem --netlist-format vacask --netlist divider.sim examples/vacask.sch
+
+# Generate a deck and run the selected simulator:
+fschem --simulator ngspice --simulate divider.raw examples/spice.sch
+fschem --simulator vacask --simulate divider.raw examples/vacask.sch
+```
+
+For a source checkout, replace `fschem` with `cargo run --`. Add repeatable
+`-L /path/to/library` options as needed. Output parent directories must exist.
+
+`--netlist-format` accepts `spice` (default; `ngspice` is an alias) or `vacask`.
+`--simulator` accepts `ngspice` (default) or `vacask`, and applies only to
+`--simulate`. Simulation always generates the matching native deck; it saves
+`.spice` or `.sim` and `.log` companions beside the required `.raw` destination.
+The selected simulator must be on `PATH`. VACASK schematics need native testbench
+code; choosing VACASK does not translate ngspice commands.
+
+Use exactly one input schematic and one mode: `--netlist` or `--simulate`.
+Neither combines with `--check`, `--smoke-test`, or `--screenshot`. Successful runs
+print output paths; errors go to stderr with a nonzero exit status. Existing raw
+results are retained if simulation fails. See `fschem --help` for all options.
 
 ### SPICE netlist export
 
@@ -112,11 +144,13 @@ export before writing a deck. Supply model includes and simulation commands in
 the schematic; the export-only command does not invoke a simulator. Source schematics and symbols
 are not modified. `examples/spice.sch` is a self-contained runnable divider.
 
-### Run ngspice and save raw data
+### Run a simulation and save raw data
 
-Open a schematic and click **Run ngspice…** in the toolbar. Choose a `.raw`
-destination; fschem generates the netlist and runs ngspice in the background.
-For a destination named `divider.raw`, the output files are:
+Choose **ngspice** (default) or **VACASK** in the **Simulator** menu, then click
+**▶** in the toolbar. The selection applies to subsequent runs in this session.
+Choose a `.raw` destination; fschem generates the netlist and runs the selected
+simulator in the background. With ngspice and a destination named `divider.raw`,
+the output files are:
 
 - `divider.raw` — ngspice raw simulation data.
 - `divider.spice` — generated SPICE deck.
@@ -135,6 +169,51 @@ Startup OSDI preload failures are shown as non-blocking notices if ngspice exits
 successfully and produces raw data; circuit/model and analysis failures still
 fail the run. A failed simulation does not replace an existing raw
 file. Try `examples/spice.sch` for an operating-point simulation with VOUT = 2 V.
+
+#### VACASK
+
+Install `vacask` on the application's `PATH`. No `ng2vc` or Python converter is
+used: fschem generates native VACASK syntax directly from schematic connectivity.
+Try **`examples/vacask.sch`**, select **Simulator → VACASK**, and click **▶**.
+The example runs operating point, transient, and AC analyses (VOUT = 2 V at DC).
+
+Write native testbench syntax in a `netlist_commands` symbol's `value`:
+
+```text
+control
+  abort always
+  analysis op1 op
+  analysis tran1 tran step=1n stop=10n
+  analysis ac1 ac from=1 to=1G mode="dec" points=10
+endc
+```
+
+Commands are passed through, not translated, so other VACASK analyses and control
+constructs are available too. Use `abort always` to stop on failed analyses;
+VACASK otherwise allows failed analyses to continue and can return partial results.
+For a schematic shared with ngspice, set `vacask_code` on the code instance to keep
+native commands separate from its SPICE `value`. The schematic's **E** global block
+provides the native preamble (`include`, `parameters`, models); **S** remains SPICE.
+
+Built-in native mappings cover two-terminal resistors, capacitors, inductors,
+and voltage/current sources. Their `value` is a **VACASK** value (suffixes are
+case-sensitive). Set `vacask_params` for native parameter assignments such as
+`dc=3 mag=1` or `type="pulse" val0=0 val1=1 rise=1n fall=1n width=5n period=10n`.
+SPICE `PULSE(...)` values and dot-card analyses are not converted.
+
+Other devices and subcircuit symbols need `vacask_format`, for example
+`@name (@pinlist) @model` or `@name (@pinlist) @symname`. It uses the same pin and
+property substitutions as SPICE formats. Put native model/load declarations in
+`vacask_model` (deduplicated), a code block, or the E preamble. Native hierarchy
+uses `subckt`/`ends`; `vacask_stop=true` leaves its definition to your includes.
+Use `vacask_ignore=true` to omit an instance from native netlisting.
+
+fschem runs `vacask -qp -sp` in an isolated output directory and searches the
+schematic directory for relative includes and device loads. Native `.sim` and
+`.log` files are saved beside the chosen `.raw` file. All top-level `.raw` files
+created by the testbench are combined in filename order for the waveform viewer;
+use plain analysis names, not paths. Previous results are retained on a failed
+run or malformed output. Postprocessing scripts are skipped.
 
 ### Plot raw simulation data
 
@@ -170,6 +249,27 @@ samples. Non-finite samples and values ineligible for logarithmic display are
 shown as gaps. On backends without native child-window support, the plot uses
 an embedded egui window instead.
 
+#### Graphs inside schematics
+
+Select a graph to edit **Graph properties** in the Properties panel. Enter a
+source path in `rawfile`, or click **Browse raw file…**. Clearing the path restores
+automatic source selection. Graph property edits support undo/redo and are saved
+with the schematic; selecting several graphs applies edits to all of them.
+
+Rectangles with `flags=graph` display raw data automatically. `rawfile` names an
+absolute path or a path relative to the schematic directory; without it,
+`circuit.sch` loads `circuit.raw` alongside the schematic. Visible graphs check
+for creation and changes every 500 ms. Parsing runs in the background, and the
+last valid plot remains visible while an incomplete replacement is retried.
+The separate waveform window also refreshes automatically, preserving its signal
+selection and view.
+
+Graph `node` entries select raw signals (either `out` or `v(out)`); `dataset`
+selects a zero-based raw plot. Numeric `x1`, `x2`, `y1`, `y2` bounds and `logx`
+are supported. Without explicit bounds, axes fit the selected data. Embedded
+plots leave mouse gestures to the schematic editor. Tcl paths, signal arithmetic,
+logarithmic Y axes and full Xschem sweep/dataset semantics are not implemented.
+
 #### Waveform performance
 
 The waveform window repaints independently of the schematic. Trace projection
@@ -201,7 +301,8 @@ Other platforms use the in-window menu bar.
 
 | Control | Action |
 | --- | --- |
-| Ctrl/Command-O | Open a schematic or symbol |
+| Ctrl/Command-O | Open a schematic or symbol in a new tab |
+| Ctrl/Command-W | Close the active tab |
 | Ctrl/Command-R | Reload the current file and its symbol dependencies |
 | Ctrl/Command-S | Save; documents without a path open a save dialog |
 | Ctrl/Command-Shift-S | Save As |
@@ -221,7 +322,7 @@ Other platforms use the in-window menu bar.
 | F / Home | Fit visible drawing layers |
 | i | Descend into the selected instance's symbol |
 | e | Descend into the selected instance's schematic |
-| Shift-E | Pop one frame from the global navigation stack |
+| Shift-E | Pop one frame from the active tab's navigation stack |
 | Double-click component | Descend into its symbol (same as i) |
 | Up button | Same stack pop as Shift-E |
 
@@ -247,15 +348,19 @@ by the usual document/library search. Static attribute substitutions such as
 `@symname` and environment references are supported. Missing or dynamic targets
 leave the current view in place and show a diagnostic.
 
-Symbol and schematic navigation, ordinary file opens, and the Up button
-all use this one stack. Reload refreshes the current view without
+Symbol and schematic navigation and the Up button use the active tab's stack.
+Ordinary file opens start a new tab with an empty stack; switching tabs preserves
+views and undo histories. Reload refreshes the current view without
 pushing a frame. For an embedded symbol it rebuilds the current embedded
 snapshot and its dependencies; reload its containing document to read a new
 embedded definition from disk.
 
 Changes stay in memory until Save. The status bar distinguishes modified, saved,
 and unnamed documents. Saving an embedded-symbol view uses Save As to create a
-standalone symbol file. Reload replaces the current document and its edit history.
+standalone symbol file. Going up from an edited child, reloading an edited view,
+closing a tab, or quitting offers Save / Don't Save / Cancel. Closing checks all
+frames in the tab; quitting checks every tab. Cancelling a save dialog or a failed
+save prevents closing. Reload replaces the current document and its edit history.
 
 ## Symbol libraries
 
@@ -333,8 +438,9 @@ source text; directly mutating the typed records does not serialize those change
 - Basic label substitution is a single pass; nested substitutions, full net
   names, simulation annotation, parameter inheritance and complete Xschem
   command semantics remain to be implemented.
-- Waveform plots and embedded images are retained in the document but currently
-  shown as rectangle boundaries.
+- Embedded images are retained in the document but shown as rectangle boundaries.
+  Schematic waveform graphs support the properties described above, not the full
+  Xschem graph expression language.
 - Stipple/custom fill patterns are approximated; curves are tessellated and
   rendering is not pixel-identical to Xschem. Rotated/mirrored text is kept
   readable using Xschem's stroke-font layout convention.
@@ -363,7 +469,9 @@ src/stroke_font.rs  Compiled-in stroke font, decoded and cached once
 
 src/canvas.rs       egui painting, clipping, mesh preparation and display styles
 src/viewer.rs       egui application, panels, background loading and navigation
-src/waveforms.rs    Native waveform subwindow, signal selection and egui_plot charts
+src/waveforms.rs    Native waveform subwindow and automatic raw-file refresh
+src/graph.rs        Shared waveform model, signal selection, axes and LOD rendering
+src/schematic_graphs.rs Schematic graph bindings and background raw-file refresh
 src/waveform_lod.rs Peak-preserving viewport queries and multiresolution extrema index
 src/main.rs         CLI and native application entry point
 ```

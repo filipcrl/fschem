@@ -1,5 +1,5 @@
 //! Navigation targets and Xschem symbol-to-schematic resolution, independent of
-//! the GUI. The application owns one stack of views for all target types.
+//! the GUI. Each document tab owns a stack of views for all target types.
 use crate::{
     document::{Document, Properties},
     library::LibraryPaths,

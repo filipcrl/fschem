@@ -7,7 +7,6 @@ use fschem::{
     library::LibraryPaths,
     navigation::{self, Descent, DocumentTarget},
     scene::{LoadedDocument, Selection},
-    stroke_font::StrokeFont,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,9 +21,20 @@ use std::{
 };
 
 const DEMO: &str = include_str!("../examples/demo.sch");
+const DEFAULT_GRID_SPACING: f64 = 10.;
+const MIN_GRID_SPACING: f64 = 0.001;
+const MAX_GRID_SPACING: f64 = 1e6;
 
 fn canvas_id() -> egui::Id {
     egui::Id::new("schematic_canvas")
+}
+
+fn format_grid_spacing(spacing: f64) -> String {
+    let mut text = format!("{spacing:.6}");
+    if text.contains('.') {
+        text = text.trim_end_matches('0').trim_end_matches('.').to_owned();
+    }
+    text
 }
 
 pub struct Options {
@@ -61,6 +71,7 @@ struct DocumentView {
     moving: Option<MoveState>,
     wiring: Option<WireState>,
     history: CommandHistory,
+    graphs: crate::schematic_graphs::SchematicGraphs,
 }
 struct MoveState {
     original: Arc<LoadedDocument>,
@@ -103,6 +114,7 @@ impl DocumentView {
             moving: None,
             wiring: None,
             history: CommandHistory::default(),
+            graphs: Default::default(),
         }
     }
     fn name(&self) -> String {
@@ -508,6 +520,62 @@ impl DocumentView {
             None
         }
     }
+    fn selected_instance_records(&self) -> BTreeSet<usize> {
+        self.selected
+            .iter()
+            .filter_map(|selection| match selection {
+                Selection::Instance(index) => {
+                    self.loaded.scene.instance_records.get(index).copied()
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    fn selected_graph_records(&self) -> BTreeSet<usize> {
+        self.selected.iter().filter_map(|selection| {
+            let Selection::Primitive(index) = selection else { return None; };
+            match &self.loaded.document.records.get(*index)?.kind {
+                RecordKind::Rectangle { properties, .. }
+                    if properties.get("flags").is_some_and(|flags| flags.split_whitespace().any(|flag| flag == "graph")) => Some(*index),
+                _ => None,
+            }
+        }).collect()
+    }
+    fn set_selected_graph_property(
+        &mut self,
+        key: String,
+        value: String,
+        paths: &LibraryPaths,
+    ) -> Result<(), String> {
+        let records = self.selected_graph_records();
+        if records.is_empty() { return Ok(()); }
+        let before = EditState {
+            document: Arc::clone(&self.loaded.document),
+            selection: records,
+        };
+        // Only graph records are edited, even when components are also selected.
+        self.execute_command(EditOperation::SetRecordProperty { key, value }, before, paths)
+    }
+    fn set_selected_instance_property(
+        &mut self,
+        key: String,
+        value: String,
+        paths: &LibraryPaths,
+    ) -> Result<(), String> {
+        let records = self.selected_instance_records();
+        if records.is_empty() {
+            return Ok(());
+        }
+        let before = EditState {
+            document: Arc::clone(&self.loaded.document),
+            selection: records,
+        };
+        self.execute_command(
+            EditOperation::SetInstanceProperty { key, value },
+            before,
+            paths,
+        )
+    }
     fn selection_bounds(&self, show_hidden: bool) -> BTreeMap<Selection, Bounds> {
         let mut bounds: BTreeMap<Selection, Bounds> = BTreeMap::new();
         for item in &self.loaded.scene.items {
@@ -573,8 +641,10 @@ impl DocumentView {
             (a.size().x * a.size().y).total_cmp(&(b.size().x * b.size().y))
         });
         if additive {
-            if let Some((id, _)) = hits.iter().find(|(id, _)| !self.selected.contains(id)) {
-                self.selected.insert(*id);
+            if let Some((id, _)) = hits.first() {
+                if !self.selected.remove(id) {
+                    self.selected.insert(*id);
+                }
             }
             return;
         }
@@ -612,6 +682,169 @@ struct ExportCompletion {
     message: String,
     raw: Option<PathBuf>,
 }
+#[derive(Default)]
+struct DocumentTab {
+    current: Option<DocumentView>,
+    stack: Vec<DocumentView>,
+}
+
+fn tab_label(stack: &[DocumentView], current: Option<&DocumentView>) -> String {
+    tab_names(stack, current).join(">")
+}
+
+fn tab_names(stack: &[DocumentView], current: Option<&DocumentView>) -> Vec<String> {
+    stack
+        .iter()
+        .chain(current)
+        .map(|view| {
+            let name = view.name();
+            let stem = Path::new(&name)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy();
+            format!("{stem}{}", if view.modified() { "*" } else { "" })
+        })
+        .collect()
+}
+
+/// One flat hit target and background, with a separate, unboxed close target.
+fn document_tab(ui: &mut egui::Ui, names: &[String], active: bool) -> (bool, bool) {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let foreground = if active {
+        ui.visuals().selection.stroke.color
+    } else {
+        ui.visuals().text_color()
+    };
+    let muted = foreground.gamma_multiply(0.65);
+    let names = if names.is_empty() {
+        &["Start".to_owned()][..]
+    } else {
+        names
+    };
+    let labels: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            ui.painter().layout_no_wrap(
+                name.clone(),
+                font.clone(),
+                if index + 1 == names.len() {
+                    foreground
+                } else {
+                    muted
+                },
+            )
+        })
+        .collect();
+    let height = (font.size + 10.).max(26.);
+    let separator_width = 24.;
+    let close_width = 26.;
+    let width = 10.
+        + labels.iter().map(|label| label.size().x).sum::<f32>()
+        + separator_width * (labels.len() - 1) as f32
+        + 6.
+        + close_width;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let close_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.right() - close_width, rect.top()), rect.max);
+    let body_rect =
+        egui::Rect::from_min_max(rect.min, egui::pos2(close_rect.left(), rect.bottom()));
+    let body = ui.interact(body_rect, response.id.with("body"), egui::Sense::click());
+    let close = ui
+        .interact(close_rect, response.id.with("close"), egui::Sense::click())
+        .on_hover_text("Close tab (Cmd/Ctrl-W)");
+    let fill = if active {
+        ui.visuals().selection.bg_fill
+    } else if body.hovered() || close.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        ui.visuals().widgets.inactive.weak_bg_fill
+    };
+    ui.painter().rect_filled(rect, 0., fill);
+    let mut x = rect.left() + 10.;
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            let center = egui::pos2(x + separator_width / 2., rect.center().y);
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    center + egui::vec2(-2., -4.),
+                    center + egui::vec2(2., 0.),
+                    center + egui::vec2(-2., 4.),
+                ],
+                egui::Stroke::new(1.4, muted),
+            ));
+            x += separator_width;
+        }
+        ui.painter().galley(
+            egui::pos2(x, rect.center().y - label.size().y / 2.),
+            label.clone(),
+            foreground,
+        );
+        x += label.size().x;
+    }
+    let center = close_rect.center();
+    let stroke = egui::Stroke::new(1.3, if close.hovered() { foreground } else { muted });
+    for sign in [-1., 1.] {
+        ui.painter().line_segment(
+            [
+                center + egui::vec2(-3., -3. * sign),
+                center + egui::vec2(3., 3. * sign),
+            ],
+            stroke,
+        );
+    }
+    (body.clicked(), close.clicked())
+}
+
+// Cancelled Save As and failed writes also cancel the destructive operation.
+fn confirm_leave(view: &mut DocumentView, paths: &LibraryPaths) -> Result<bool, String> {
+    view.cancel_move();
+    view.wiring = None;
+    view.selection_box = None;
+    if !view.modified() {
+        return Ok(true);
+    }
+    let answer = rfd::MessageDialog::new()
+        .set_title("Unsaved changes")
+        .set_description(format!("Save changes to {} before leaving?", view.name()))
+        .set_level(rfd::MessageLevel::Warning)
+        .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+            "Save".into(),
+            "Don't Save".into(),
+            "Cancel".into(),
+        ))
+        .show();
+    match answer {
+        rfd::MessageDialogResult::Yes => {}
+        rfd::MessageDialogResult::No => return Ok(true),
+        rfd::MessageDialogResult::Custom(ref label) if label == "Save" => {}
+        rfd::MessageDialogResult::Custom(ref label) if label == "Don't Save" => return Ok(true),
+        _ => return Ok(false),
+    }
+    let path = view.loaded.path.clone().or_else(|| {
+        rfd::FileDialog::new()
+            .set_title("Save schematic or symbol")
+            .add_filter("Xschem schematic or symbol", &["sch", "sym"])
+            .set_file_name(view.name())
+            .save_file()
+            .map(|mut path| {
+                if path.extension().is_none() {
+                    path.set_extension(
+                        Path::new(&view.name())
+                            .extension()
+                            .unwrap_or(std::ffi::OsStr::new("sch")),
+                    );
+                }
+                path
+            })
+    });
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    view.save_to(&path, paths)?;
+    Ok(true)
+}
+
 enum Action {
     Undo,
     Redo,
@@ -620,6 +853,7 @@ enum Action {
     Save,
     SaveAs,
     OpenDialog,
+    CloseTab,
     Demo,
     Reload,
     ExportSpice,
@@ -634,8 +868,11 @@ pub struct Viewer {
     #[cfg(target_os = "macos")]
     native_menu: Option<crate::macos_menu::NativeMenu>,
     current: Option<DocumentView>,
-    /// One application-level stack shared by every symbol/schematic transition.
+    /// Active tab state; inactive tabs are parked in `tabs`.
     navigation_stack: Vec<DocumentView>,
+    tabs: Vec<DocumentTab>,
+    active_tab: usize,
+    opening_tab: bool,
     paths: LibraryPaths,
     sender: mpsc::Sender<Completion>,
     receiver: mpsc::Receiver<Completion>,
@@ -644,6 +881,7 @@ pub struct Viewer {
     error: Option<String>,
     export: Option<mpsc::Receiver<Result<ExportCompletion, String>>>,
     export_status: Option<String>,
+    simulator: fschem::simulation::Simulator,
     waveforms: crate::waveforms::Waveforms,
     show_grid: bool,
     grid_spacing: f64,
@@ -671,6 +909,9 @@ impl Viewer {
             native_menu: None,
             current: None,
             navigation_stack: Vec::new(),
+            tabs: vec![DocumentTab::default()],
+            active_tab: 0,
+            opening_tab: false,
             paths: options.libraries,
             sender,
             receiver,
@@ -679,9 +920,10 @@ impl Viewer {
             error: None,
             export: None,
             export_status: None,
+            simulator: fschem::simulation::Simulator::default(),
             waveforms: crate::waveforms::Waveforms::default(),
             show_grid: true,
-            grid_spacing: 20.,
+            grid_spacing: DEFAULT_GRID_SPACING,
             show_hidden: false,
             show_libraries: false,
             show_source: false,
@@ -715,6 +957,7 @@ impl Viewer {
         if let Some(menu) = &self.native_menu {
             let keyboard =
                 !ctx.wants_keyboard_input() || ctx.memory(|memory| memory.has_focus(canvas_id()));
+            menu.sync_simulator(self.simulator);
             menu.sync_history(
                 if keyboard { self.undo_label() } else { None },
                 if keyboard { self.redo_label() } else { None },
@@ -746,6 +989,87 @@ impl Viewer {
         }
     }
 
+    fn park_tab(&mut self) {
+        self.tabs[self.active_tab] = DocumentTab {
+            current: self.current.take(),
+            stack: std::mem::take(&mut self.navigation_stack),
+        };
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        if index == self.active_tab {
+            return;
+        }
+        // Invalidate pending loads so they cannot land in another tab.
+        self.request += 1;
+        self.loading = None;
+        self.opening_tab = false;
+        self.park_tab();
+        self.active_tab = index;
+        let tab = std::mem::take(&mut self.tabs[index]);
+        self.current = tab.current;
+        self.navigation_stack = tab.stack;
+        self.pointer = None;
+        self.last_pointer = None;
+        self.error = None;
+    }
+
+    fn open_tab(&mut self, ctx: &egui::Context, path: Option<PathBuf>) {
+        self.load(ctx, path, false);
+        self.opening_tab = true;
+    }
+
+    fn confirm_active(&mut self, whole_stack: bool) -> bool {
+        let views = self.current.iter_mut().chain(
+            self.navigation_stack
+                .iter_mut()
+                .rev()
+                .take(if whole_stack { usize::MAX } else { 0 }),
+        );
+        for view in views {
+            match confirm_leave(view, &self.paths) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => {
+                    self.error = Some(error);
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn close_tab(&mut self, index: usize) {
+        self.switch_tab(index);
+        if !self.confirm_active(true) {
+            return;
+        }
+        self.request += 1;
+        self.loading = None;
+        self.current = None;
+        self.navigation_stack.clear();
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.tabs.push(DocumentTab::default());
+        }
+        self.active_tab = index.min(self.tabs.len() - 1);
+        let tab = std::mem::take(&mut self.tabs[self.active_tab]);
+        self.current = tab.current;
+        self.navigation_stack = tab.stack;
+    }
+
+    fn confirm_quit(&mut self) -> bool {
+        let original = self.active_tab;
+        for index in 0..self.tabs.len() {
+            self.switch_tab(index);
+            if !self.confirm_active(true) {
+                return false;
+            }
+        }
+        self.switch_tab(original);
+        true
+    }
+
     fn load(&mut self, ctx: &egui::Context, path: Option<PathBuf>, history: bool) {
         self.load_target(ctx, path.map(DocumentTarget::File), history);
     }
@@ -755,6 +1079,7 @@ impl Viewer {
         target: Option<DocumentTarget>,
         push_frame: bool,
     ) {
+        self.opening_tab = false;
         self.request += 1;
         self.loading = Some(PathBuf::from(
             target
@@ -816,6 +1141,12 @@ impl Viewer {
                     view.target = completion.target;
                     let name = view.name();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — fschem")));
+                    if self.opening_tab && self.current.is_some() {
+                        self.park_tab();
+                        self.tabs.push(DocumentTab::default());
+                        self.active_tab = self.tabs.len() - 1;
+                    }
+                    self.opening_tab = false;
                     if let Some(old) = self.current.take().filter(|_| completion.push_frame) {
                         self.navigation_stack.push(old);
                     }
@@ -919,6 +1250,12 @@ impl Viewer {
         self.current.as_ref()?.history.redo_label()
     }
     fn action(&mut self, ctx: &egui::Context, action: Action) {
+        if (matches!(action, Action::Back) && !self.navigation_stack.is_empty()
+            || matches!(action, Action::Reload))
+            && !self.confirm_active(false)
+        {
+            return;
+        }
         if matches!(action, Action::Undo | Action::Redo) {
             let undo = matches!(action, Action::Undo);
             if (if undo {
@@ -1044,9 +1381,10 @@ impl Viewer {
                 {
                     self.waveforms.load(ctx, path);
                 } else {
-                    self.load(ctx, Some(path), true);
+                    self.open_tab(ctx, Some(path));
                 }
             }
+            Action::CloseTab => self.close_tab(self.active_tab),
             Action::OpenRaw => self.waveforms.open_dialog(ctx),
             Action::OpenDialog => {
                 let mut dialog = rfd::FileDialog::new()
@@ -1060,10 +1398,10 @@ impl Viewer {
                     dialog = dialog.set_directory(dir);
                 }
                 if let Some(path) = dialog.pick_file() {
-                    self.load(ctx, Some(path), true);
+                    self.open_tab(ctx, Some(path));
                 }
             }
-            Action::Demo => self.load(ctx, None, true),
+            Action::Demo => self.open_tab(ctx, None),
             Action::ExportSpice | Action::Simulate => {
                 let simulate = matches!(action, Action::Simulate);
                 if !self.can_export() {
@@ -1085,8 +1423,8 @@ impl Viewer {
                     .into_owned();
                 let dialog = if simulate {
                     rfd::FileDialog::new()
-                        .set_title("Run ngspice — save raw results")
-                        .add_filter("ngspice raw data", &["raw"])
+                        .set_title(format!("Run {} — save raw results", self.simulator.name()))
+                        .add_filter("Simulation raw data", &["raw"])
                 } else {
                     rfd::FileDialog::new().add_filter("SPICE netlist", &["spice", "sp", "cir"])
                 };
@@ -1103,18 +1441,16 @@ impl Viewer {
                     let ctx = ctx.clone();
                     let (tx, rx) = mpsc::channel();
                     self.export = Some(rx);
-                    self.export_status = Some(
-                        if simulate {
-                            "Generating netlist and running ngspice…"
-                        } else {
-                            "Exporting SPICE netlist…"
-                        }
-                        .into(),
-                    );
+                    let simulator = self.simulator;
+                    self.export_status = Some(if simulate {
+                        format!("Generating netlist and running {}…", simulator.name())
+                    } else {
+                        "Exporting SPICE netlist…".into()
+                    });
                     self.error = None;
                     std::thread::spawn(move || {
                         let result = if simulate {
-                            fschem::simulation::run(&document, &source, paths, &path).map(|files| {
+                            fschem::simulation::run_with_simulator(simulator, &document, &source, paths, &path).map(|files| {
                                 let mut message = format!(
                                     "Simulation complete: {} · Netlist: {} · Log: {}",
                                     files.raw.display(),
@@ -1123,7 +1459,7 @@ impl Viewer {
                                 );
                                 if !files.warnings.is_empty() {
                                     message.push_str(&format!(
-                                        "\n{} ngspice startup notice(s); see log. {}",
+                                        "\n{} simulator startup notice(s); see log. {}",
                                         files.warnings.len(),
                                         files.warnings[0]
                                     ));
@@ -1208,12 +1544,16 @@ impl Viewer {
             ctx.request_repaint();
         }
         let mut actions = Vec::new();
+        let mut property_edits: Vec<(String, String)> = Vec::new();
+        let mut graph_property_edits: Vec<(String, String)> = Vec::new();
         #[cfg(target_os = "macos")]
         if let Some(menu) = &self.native_menu {
             use crate::macos_menu::Command;
             for command in menu.commands() {
                 match command {
                     Command::Open => actions.push(Action::OpenDialog),
+                    Command::CloseTab => actions.push(Action::CloseTab),
+                    Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     Command::Undo => actions.push(Action::Undo),
                     Command::Redo => actions.push(Action::Redo),
                     Command::Edit(key) => actions.push(Action::Edit(key)),
@@ -1222,6 +1562,8 @@ impl Viewer {
                     Command::Demo => actions.push(Action::Demo),
                     Command::Reload => actions.push(Action::Reload),
                     Command::ExportSpice => actions.push(Action::ExportSpice),
+                    Command::Simulate => actions.push(Action::Simulate),
+                    Command::Simulator(simulator) => self.simulator = simulator,
                     Command::Fit => actions.push(Action::Fit),
                     Command::Grid => self.show_grid = !self.show_grid,
                     Command::Hidden => self.show_hidden = !self.show_hidden,
@@ -1280,6 +1622,12 @@ impl Viewer {
                 Key::O,
             )) {
                 actions.push(Action::OpenDialog);
+            }
+            if input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                Key::W,
+            )) {
+                actions.push(Action::CloseTab);
             }
             if input.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,
@@ -1348,6 +1696,10 @@ impl Viewer {
                         .clicked()
                     {
                         actions.push(Action::SaveAs);
+                        ui.close();
+                    }
+                    if ui.button("Close tab     Ctrl/Command-W").clicked() {
+                        actions.push(Action::CloseTab);
                         ui.close();
                     }
                     if ui.button("Built-in demonstration").clicked() {
@@ -1473,6 +1825,13 @@ impl Viewer {
                         ui.close();
                     }
                 });
+                ui.menu_button("Simulator", |ui| {
+                    for simulator in fschem::simulation::Simulator::ALL {
+                        if ui.selectable_value(&mut self.simulator, simulator, simulator.name()).clicked() {
+                            ui.close();
+                        }
+                    }
+                });
                 if ui.button("Libraries…").clicked() {
                     self.show_libraries = true;
                 }
@@ -1489,11 +1848,11 @@ impl Viewer {
                 if ui.add_enabled(self.can_save(), egui::Button::new("Save")).on_hover_text("Save schematic or symbol (Cmd/Ctrl-S)").clicked() {
                     actions.push(Action::Save);
                 }
-                if ui.button("Open raw…").on_hover_text("Plot ngspice raw data in a separate waveform window").clicked() {
+                if ui.button("Open raw…").on_hover_text("Plot simulation raw data in a separate waveform window").clicked() {
                     actions.push(Action::OpenRaw);
                 }
-                if ui.add_enabled(self.can_export(), egui::Button::new("Run ngspice…"))
-                    .on_hover_text("Generate a SPICE netlist, run ngspice, and save .raw results plus .spice and .log files")
+                if ui.add_enabled(self.can_export(), egui::Button::new("▶"))
+                    .on_hover_text(format!("Run {} — generate a netlist and save raw results and log", self.simulator.name()))
                     .clicked() {
                     actions.push(Action::Simulate);
                 }
@@ -1516,12 +1875,25 @@ impl Viewer {
                 ui.separator();
                 ui.weak(format!("Depth {}", self.navigation_stack.len()));
                 ui.checkbox(&mut self.show_grid, "Grid");
-                ui.add(
-                    egui::DragValue::new(&mut self.grid_spacing)
-                        .range(0.001..=1e6)
-                        .speed(1.)
-                        .prefix("Spacing "),
-                );
+                ui.label(format!("Spacing {}", format_grid_spacing(self.grid_spacing)));
+                if ui
+                    .add_enabled(
+                        self.grid_spacing > MIN_GRID_SPACING,
+                        egui::Button::new("½ grid"),
+                    )
+                    .clicked()
+                {
+                    self.grid_spacing = (self.grid_spacing / 2.).max(MIN_GRID_SPACING);
+                }
+                if ui
+                    .add_enabled(
+                        self.grid_spacing < MAX_GRID_SPACING,
+                        egui::Button::new("2× grid"),
+                    )
+                    .clicked()
+                {
+                    self.grid_spacing = (self.grid_spacing * 2.).min(MAX_GRID_SPACING);
+                }
                 if let Some(current) = &self.current {
                     ui.monospace(format!("{:.0}%", current.viewport.zoom * 100.));
                 }
@@ -1534,6 +1906,44 @@ impl Viewer {
                 }
             });
         });
+        let mut switch = None;
+        let mut close = None;
+        egui::TopBottomPanel::top("document_tabs")
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (index, tab) in self.tabs.iter().enumerate() {
+                            let active = index == self.active_tab;
+                            let names = if active {
+                                tab_names(&self.navigation_stack, self.current.as_ref())
+                            } else {
+                                tab_names(&tab.stack, tab.current.as_ref())
+                            };
+                            let (selected, closed) = document_tab(ui, &names, active);
+                            if selected {
+                                switch = Some(index);
+                            }
+                            if closed {
+                                close = Some(index);
+                            }
+                        }
+                    });
+                });
+            });
+        if let Some(index) = switch {
+            self.switch_tab(index);
+        }
+        if let Some(index) = close {
+            self.close_tab(index);
+        }
+        let title = tab_label(&self.navigation_stack, self.current.as_ref());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(if title.is_empty() {
+            "fschem".into()
+        } else {
+            format!("{title} — fschem")
+        }));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             if let Some(status) = &self.export_status {
                 ui.label(status);
@@ -1601,7 +2011,7 @@ impl Viewer {
                         }
                     });
                     ui.separator();
-                    ui.heading("Instance");
+                    ui.heading("Selection");
                     if current.moving.is_some() {
                         ui.colored_label(Color32::from_rgb(255, 185, 65), if current.moving.as_ref().is_some_and(|moving| moving.copying) {
                             "Copying · Left-click to place · Esc to cancel"
@@ -1613,20 +2023,94 @@ impl Viewer {
                     } else if !current.selected.is_empty() {
                         ui.weak(format!("{} selected · G: move · C: copy · W: wire", current.selected.len()));
                     }
-                    if let Some(instance) = current.selected_instance().and_then(|i| loaded.scene.instances.get(i)) {
-                        ui.strong(instance.properties.get("name").unwrap_or("Unnamed instance"));
-                        ui.label(&instance.symbol);
-                        ui.monospace(format!("({}, {}) · rot {} · flip {}", instance.at.x, instance.at.y, instance.rotation, instance.flip));
-                        ui.horizontal(|ui| {
-                            if ui.add_enabled(self.loading.is_none(), egui::Button::new("Symbol (i)")).clicked() { actions.push(Action::Descend(Descent::Symbol)); }
-                            if ui.add_enabled(self.loading.is_none(), egui::Button::new("Schematic (e)")).clicked() { actions.push(Action::Descend(Descent::Schematic)); }
-                        });
-                        if instance.embedded { ui.weak("Definition embedded in this document"); }
-                        else if instance.resolved.is_none() { ui.colored_label(Color32::LIGHT_RED, "Unresolved symbol — see diagnostics"); }
-                        let preview = preview(&instance.properties.raw, 20_000);
-                        let mut text = preview.as_str();
-                        ui.add(egui::TextEdit::multiline(&mut text).code_editor().desired_width(f32::INFINITY).desired_rows(12));
-                    } else { ui.weak("Click a component or wire to select it. Left-drag to box select. Hold Shift to add to the selection. G: move · C: copy · W: wire · i: symbol · e: schematic · Shift-E: up."); }
+                    let selected_instances: Vec<_> = current
+                        .selected
+                        .iter()
+                        .filter_map(|selection| match selection {
+                            Selection::Instance(index) => loaded.scene.instances.get(*index),
+                            _ => None,
+                        })
+                        .collect();
+                    if !selected_instances.is_empty() {
+                        if selected_instances.len() == 1 {
+                            let instance = selected_instances[0];
+                            ui.strong(instance.properties.get("name").unwrap_or("Unnamed instance"));
+                            ui.label(&instance.symbol);
+                            ui.monospace(format!("({}, {}) · rot {} · flip {}", instance.at.x, instance.at.y, instance.rotation, instance.flip));
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(self.loading.is_none(), egui::Button::new("Symbol (i)")).clicked() { actions.push(Action::Descend(Descent::Symbol)); }
+                                if ui.add_enabled(self.loading.is_none(), egui::Button::new("Schematic (e)")).clicked() { actions.push(Action::Descend(Descent::Schematic)); }
+                            });
+                            if instance.embedded { ui.weak("Definition embedded in this document"); }
+                            else if instance.resolved.is_none() { ui.colored_label(Color32::LIGHT_RED, "Unresolved symbol — see diagnostics"); }
+                        } else {
+                            ui.strong(format!("{} instances", selected_instances.len()));
+                            ui.weak("Edit a value to apply it to every selected instance.");
+                        }
+                        ui.separator();
+                        ui.heading("Properties");
+                        let mut rows: BTreeMap<String, (Option<String>, bool, usize)> = BTreeMap::new();
+                        for instance in &selected_instances {
+                            let mut seen = BTreeSet::new();
+                            for (key, value) in &instance.properties.entries {
+                                if !seen.insert(key.clone()) {
+                                    continue;
+                                }
+                                let value = value.clone().unwrap_or_default();
+                                rows.entry(key.clone())
+                                    .and_modify(|(first, mixed, count)| {
+                                        if first.as_deref() != Some(value.as_str()) {
+                                            *mixed = true;
+                                        }
+                                        *count += 1;
+                                    })
+                                    .or_insert((Some(value), false, 1));
+                            }
+                        }
+                        egui::Grid::new("instance_property_editor")
+                            .num_columns(2)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for (key, (value, mut mixed, count)) in rows {
+                                    if count != selected_instances.len() {
+                                        mixed = true;
+                                    }
+                                    ui.monospace(&key);
+                                    let mut text = if mixed { "*".to_owned() } else { value.unwrap_or_default() };
+                                    let large = !mixed && is_large_property_value(&text);
+                                    let rows = property_editor_rows(&text);
+                                    let response = if large {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut text)
+                                                .desired_width(f32::INFINITY)
+                                                .desired_rows(rows),
+                                        )
+                                    } else {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut text)
+                                                .desired_width(f32::INFINITY),
+                                        )
+                                    };
+                                    if response.changed() {
+                                        property_edits.push((key, text));
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    let graph_records = current.selected_graph_records();
+                    let graphs: Vec<_> = graph_records.iter().filter_map(|&index| {
+                        match &loaded.document.records[index].kind {
+                            RecordKind::Rectangle { properties, .. } => Some(properties),
+                            _ => None,
+                        }
+                    }).collect();
+                    if !graphs.is_empty() {
+                        ui.separator();
+                        graph_properties_ui(ui, &graphs, loaded.path.as_deref(), &mut graph_property_edits);
+                    } else if selected_instances.is_empty() {
+                        ui.weak("Click a component, graph or wire to select it. Left-drag to box select. Hold Shift to add to the selection. G: move · C: copy · W: wire · i: symbol · e: schematic · Shift-E: up.");
+                    }
                 } else { ui.weak("No document open"); }
             });
         });
@@ -1691,7 +2175,6 @@ impl Viewer {
                         painter: &painter,
                         rect,
                         viewport: current.viewport,
-                        font: StrokeFont::bundled(),
                     };
                     self.pointer = response.hover_pos().map(|pos| canvas.world(pos));
                     if self.pointer.is_some() { self.last_pointer = self.pointer; }
@@ -1761,6 +2244,7 @@ impl Viewer {
                         self.show_hidden,
                         &current.selected,
                     );
+                    current.graphs.paint(ui, &canvas, &current.loaded, &current.layers);
                     if let Some(wiring) = &current.wiring {
                         canvas.wire_preview(wiring.start, wiring.end, wiring.on_connection);
                     }
@@ -1813,6 +2297,19 @@ impl Viewer {
                 }
             });
         self.windows(ctx, &mut actions);
+        if let Some(current) = &mut self.current {
+            for (key, value) in graph_property_edits {
+                if let Err(error) = current.set_selected_graph_property(key, value, &self.paths) {
+                    self.error = Some(error);
+                }
+            }
+            for (key, value) in property_edits {
+                if let Err(error) = current.set_selected_instance_property(key, value, &self.paths)
+                {
+                    self.error = Some(error);
+                }
+            }
+        }
         for action in actions {
             self.action(ctx, action);
         }
@@ -1956,6 +2453,9 @@ impl Viewer {
 }
 impl eframe::App for Viewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().close_requested()) && !self.confirm_quit() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         self.show(ctx);
         self.waveforms.show(ctx);
     }
@@ -1983,9 +2483,121 @@ fn preview(text: &str, count: usize) -> String {
     }
 }
 
+fn graph_properties_ui(
+    ui: &mut egui::Ui,
+    graphs: &[&fschem::document::Properties],
+    document: Option<&Path>,
+    edits: &mut Vec<(String, String)>,
+) {
+    ui.heading("Graph properties");
+    if graphs.len() > 1 {
+        ui.weak(format!("{} graphs · edits apply to all selected graphs", graphs.len()));
+    }
+    ui.weak("Raw file: absolute path or relative to the schematic. Leave empty to use the schematic's .raw file.");
+    let mut keys: BTreeSet<String> = ["rawfile", "node", "dataset", "x1", "x2", "y1", "y2", "logx"]
+        .into_iter().map(str::to_owned).collect();
+    for props in graphs {
+        keys.extend(props.entries.iter().map(|(key, _)| key.clone()));
+    }
+    // Keep the source selector first, then show every stored graph property.
+    keys.remove("rawfile");
+    egui::Grid::new("graph_property_editor").num_columns(2).striped(true).show(ui, |ui| {
+        for key in std::iter::once("rawfile".to_owned()).chain(keys) {
+            let first = graphs[0].get(&key).unwrap_or_default();
+            let mixed = graphs.iter().any(|props| props.get(&key).unwrap_or_default() != first);
+            let mut text = if mixed { "*".to_owned() } else { first.to_owned() };
+            ui.monospace(&key);
+            ui.vertical(|ui| {
+                let response = if key == "node" || is_large_property_value(&text) {
+                    let rows = property_editor_rows(&text).max(2);
+                    ui.add(egui::TextEdit::multiline(&mut text).desired_width(f32::INFINITY).desired_rows(rows))
+                } else {
+                    ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY)
+                        .hint_text(if key == "rawfile" { "Automatic (.raw beside schematic)" } else { "Automatic" }))
+                };
+                if response.changed() { edits.push((key.clone(), text)); }
+                if key == "rawfile" && ui.button("Browse raw file…").clicked() {
+                    let mut dialog = rfd::FileDialog::new().set_title("Graph source raw file")
+                        .add_filter("Simulation raw data", &["raw"]);
+                    if let Some(directory) = document.and_then(Path::parent) {
+                        dialog = dialog.set_directory(directory);
+                    }
+                    if let Some(path) = dialog.pick_file() {
+                        edits.push((key.clone(), path.to_string_lossy().into_owned()));
+                    }
+                }
+            });
+            ui.end_row();
+        }
+    });
+}
+
+fn is_large_property_value(text: &str) -> bool {
+    text.contains('\n') || text.chars().count() > 80
+}
+
+fn property_editor_rows(text: &str) -> usize {
+    let line_count = text.lines().count().max(1);
+    let wrapped_rows = (text.chars().count() / 80).max(1);
+    line_count.max(wrapped_rows).clamp(3, 16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn graph_properties_edit_source_round_trip_and_undo() {
+        let source = "v {xschem file_version=1.3}\nB 2 0 0 400 200 {flags=graph node=out custom=retained}\nB 2 0 250 400 450 {flags=graph node=in}\nN 0 0 100 0 {lab=signal}\n";
+        let paths = LibraryPaths::default();
+        let loaded = Arc::new(LoadedDocument::from_document(
+            Arc::new(Document::parse(source).unwrap()), None, paths.clone(),
+        ).unwrap());
+        let mut view = DocumentView::new(Arc::clone(&loaded), PaintCache::new(&loaded.scene));
+        view.selected = BTreeSet::from([Selection::Primitive(1), Selection::Primitive(2)]);
+        assert_eq!(view.selected_graph_records(), BTreeSet::from([1, 2]));
+        let path = "results with spaces/run.raw";
+        view.set_selected_graph_property("rawfile".into(), path.into(), &paths).unwrap();
+        let edited = view.loaded.document.original().to_owned();
+        let reparsed = Document::parse(edited.as_str()).unwrap();
+        for index in [1, 2] {
+            let RecordKind::Rectangle { properties, .. } = &reparsed.records[index].kind else { panic!() };
+            assert_eq!(properties.get("rawfile"), Some(path));
+            assert_eq!(properties.get("flags"), Some("graph"));
+        }
+        assert_eq!(reparsed.raw_record(&reparsed.records[3]), loaded.document.raw_record(&loaded.document.records[3]));
+        view.undo(&paths).unwrap();
+        assert_eq!(view.loaded.document.original(), source);
+        view.redo(&paths).unwrap();
+        assert_eq!(view.loaded.document.original(), edited);
+        view.set_selected_graph_property("node".into(), "out\nin".into(), &paths).unwrap();
+        let RecordKind::Rectangle { properties, .. } = &view.loaded.document.records[1].kind else { panic!() };
+        assert_eq!(properties.get("node"), Some("out\nin"));
+        assert_eq!(properties.get("custom"), Some("retained"));
+    }
+
+    #[test]
+    fn graph_property_panel_exposes_source_and_stored_properties() {
+        let props = fschem::document::Properties::parse("flags=graph node=out custom=retained".into());
+        let ctx = egui::Context::default();
+        let mut edits = Vec::new();
+        let mut render = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                graph_properties_ui(ui, &[&props], Some(Path::new("test.sch")), &mut edits);
+            });
+        };
+        let _ = ctx.run(egui::RawInput::default(), &mut render);
+        let output = ctx.run(egui::RawInput::default(), &mut render);
+        let labels: Vec<_> = output.shapes.iter().filter_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+            _ => None,
+        }).collect();
+        assert!(labels.contains(&"rawfile"));
+        assert!(labels.contains(&"Browse raw file…"));
+        assert!(labels.contains(&"node"));
+        assert!(labels.contains(&"custom"));
+        assert!(edits.is_empty());
+    }
+
     fn selection_view() -> DocumentView {
         let source = "v {xschem file_version=1.3}\nC {test.sym} 0 0 0 0 {name=X1}\n[\nL 4 -10 -10 10 10 {}\n]\nN0 0 100 0 {lab=signal}\nN 0 0 100 100 {}\nN -100 50 150 50 {}\nN 200 200 200 200 {}\n";
         let loaded = Arc::new(
@@ -2142,6 +2754,8 @@ mod tests {
             viewer.current.as_ref().unwrap().loaded.document.original(),
             child_edited
         );
+        // Return to the saved state before leaving; edited children now prompt.
+        shortcut(&mut viewer, &ctx, false);
         viewer.action(&ctx, Action::Back);
         shortcut(&mut viewer, &ctx, false);
         assert_eq!(
@@ -2572,7 +3186,7 @@ mod tests {
         assert!(viewer.navigation_stack.is_empty());
     }
     #[test]
-    fn additive_clicks_and_boxes_preserve_the_existing_selection() {
+    fn shift_clicks_toggle_items_and_shift_boxes_add_items() {
         let mut view = selection_view();
         view.select_at(Point::new(-8., -8.), false, false, false);
         assert_eq!(view.selected, BTreeSet::from([Selection::Instance(0)]));
@@ -2581,32 +3195,30 @@ mod tests {
             view.selected,
             BTreeSet::from([Selection::Instance(0), Selection::Wire(3)])
         );
-        view.select_at(Point::new(50., 50.), false, false, true);
-        view.select_at(Point::new(50., 50.), false, false, true);
-        assert_eq!(
-            view.selected.len(),
-            4,
-            "repeated Shift-clicks add overlapping items"
-        );
         let selection = view.selected.clone();
         view.select_at(Point::new(50., 50.), false, false, true);
+        assert!(view.selected.contains(&Selection::Wire(5)));
+        assert_eq!(view.selected.len(), 3);
+        view.select_at(Point::new(50., 50.), false, false, true);
+        assert_eq!(view.selected, selection, "Shift-click deselects the hit item even with overlaps");
         view.select_at(Point::new(300., 300.), false, false, true);
-        assert_eq!(
-            view.selected, selection,
-            "selected items and empty space do not clear the group"
-        );
+        assert_eq!(view.selected, selection, "empty space preserves the group");
+        view.select_at(Point::new(-8., -8.), false, false, true);
+        assert_eq!(view.selected, BTreeSet::from([Selection::Wire(3)]));
+        view.select_at(Point::new(-8., -8.), false, false, true);
+        assert_eq!(view.selected, selection);
         view.select_box(
             Bounds::new(Point::new(190., 190.), Point::new(210., 210.)),
             false,
             true,
         );
-        assert_eq!(view.selected.len(), 5);
+        assert_eq!(view.selected.len(), 3);
         view.select_box(
             Bounds::new(Point::new(300., 300.), Point::new(310., 310.)),
             false,
             true,
         );
-        assert_eq!(view.selected.len(), 5);
+        assert_eq!(view.selected.len(), 3);
         view.select_at(Point::new(60., 0.), false, false, false);
         assert_eq!(view.selected, BTreeSet::from([Selection::Wire(3)]));
         view.select_at(Point::new(300., 300.), false, false, false);
@@ -2886,6 +3498,49 @@ mod tests {
     }
 
     #[test]
+    fn tabs_preserve_unsaved_documents_and_undo_history() {
+        let ctx = egui::Context::default();
+        let mut viewer = Viewer::new(
+            &ctx,
+            Options {
+                input: None,
+                libraries: LibraryPaths::default(),
+                smoke_test: false,
+                screenshot: None,
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut view = selection_view();
+        view.selected = BTreeSet::from([Selection::Instance(0)]);
+        view.delete_selection(&viewer.paths).unwrap();
+        assert!(view.modified());
+        viewer.current = Some(view);
+        viewer.navigation_stack.push(selection_view());
+        let label = tab_label(&viewer.navigation_stack, viewer.current.as_ref());
+        assert!(label.ends_with('*'));
+        viewer.tabs.push(DocumentTab {
+            current: Some(selection_view()),
+            stack: Vec::new(),
+        });
+        viewer.switch_tab(1);
+        assert!(!viewer.current.as_ref().unwrap().modified());
+        assert!(viewer.navigation_stack.is_empty());
+        viewer.switch_tab(0);
+        assert_eq!(
+            tab_label(&viewer.navigation_stack, viewer.current.as_ref()),
+            label
+        );
+        assert!(viewer.current.as_ref().unwrap().modified());
+        viewer.action(&ctx, Action::Undo);
+        assert!(!viewer.current.as_ref().unwrap().modified());
+        viewer.close_tab(0);
+        viewer.close_tab(0);
+        assert!(viewer.current.is_none());
+        assert!(viewer.navigation_stack.is_empty());
+        assert_eq!(viewer.tabs.len(), 1);
+    }
+
+    #[test]
     fn navigation_stack_smoke() {
         use std::{
             fs,
@@ -2970,6 +3625,40 @@ mod tests {
         child.layers.insert(4, false);
         key(&mut viewer, &ctx, Key::I, egui::Modifiers::NONE);
         assert_eq!(viewer.current.as_ref().unwrap().name(), "cell.sym");
+        assert_eq!(viewer.navigation_stack.len(), 2);
+        assert_eq!(
+            tab_label(&viewer.navigation_stack, viewer.current.as_ref()),
+            "parent>cell>cell"
+        );
+
+        // Opening is not a descent: a fresh tab starts at depth zero.
+        viewer.action(&ctx, Action::Open(dir.join("cell.sch")));
+        settle(&mut viewer, &ctx);
+        assert_eq!(viewer.tabs.len(), 2);
+        assert_eq!(viewer.active_tab, 1);
+        assert!(viewer.navigation_stack.is_empty());
+        assert_eq!(
+            tab_label(&viewer.navigation_stack, viewer.current.as_ref()),
+            "cell"
+        );
+        viewer.switch_tab(0);
+        assert_eq!(viewer.navigation_stack.len(), 2);
+        assert_eq!(viewer.current.as_ref().unwrap().name(), "cell.sym");
+        viewer.switch_tab(1);
+        viewer.close_tab(1);
+        assert_eq!(viewer.tabs.len(), 1);
+        assert_eq!(viewer.navigation_stack.len(), 2);
+
+        // Failed opens leave the current tab and its stack untouched.
+        viewer.action(&ctx, Action::Open(dir.join("missing.sch")));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while viewer.loading.is_some() {
+            viewer.poll(&ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(viewer.error.take().is_some());
+        assert_eq!(viewer.tabs.len(), 1);
         assert_eq!(viewer.navigation_stack.len(), 2);
 
         key(&mut viewer, &ctx, Key::E, egui::Modifiers::SHIFT);

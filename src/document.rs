@@ -1,6 +1,6 @@
-//! Xschem's record grammar, not a Tcl parser. In particular, outer braced
-//! strings end at the first *unescaped* `}`; braces are not nested. Backslash
-//! quotes the next character literally (backslash-n is not a newline).
+//! Xschem's record grammar, not a Tcl parser. Braced strings may contain
+//! nested brace pairs, and backslash quotes the next character literally
+//! (backslash-n is not a newline).
 use crate::geometry::{Point, Transform, wire_route};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -105,6 +105,41 @@ impl Properties {
     }
     pub fn number(&self, key: &str) -> Option<f64> {
         self.get(key)?.parse::<f64>().ok().filter(|v| v.is_finite())
+    }
+    pub fn with_value(&self, key: &str, value: &str) -> String {
+        let mut found = false;
+        let mut entries: Vec<(String, Option<String>)> = self
+            .entries
+            .iter()
+            .map(|(entry_key, entry_value)| {
+                if entry_key == key {
+                    found = true;
+                    (entry_key.clone(), Some(value.to_owned()))
+                } else {
+                    (entry_key.clone(), entry_value.clone())
+                }
+            })
+            .collect();
+        if !found {
+            entries.push((key.to_owned(), Some(value.to_owned())));
+        }
+        Self::serialize_entries(
+            entries
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_deref())),
+        )
+    }
+    fn serialize_entries<'a>(entries: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> String {
+        entries
+            .map(|(key, value)| match value {
+                Some(value) => format!(
+                    "{key}=\"{}\"",
+                    value.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+                None => key.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -329,16 +364,7 @@ impl Document {
                             .filter(|(key, _)| key != "name")
                             .map(|(key, value)| (key.as_str(), value.as_deref())),
                     );
-                    let properties = entries
-                        .map(|(key, value)| match value {
-                            Some(value) => format!(
-                                "{key}=\"{}\"",
-                                value.replace('\\', "\\\\").replace('"', "\\\"")
-                            ),
-                            None => key.to_owned(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
+                    let properties = Properties::serialize_entries(entries);
                     let mut parser = Parser {
                         source: &raw,
                         pos: 0,
@@ -464,6 +490,80 @@ impl Document {
         }
         source.push_str(text);
         Self::parse(source).map_err(|e| e.to_string())
+    }
+    /// Edit one property on one or more instances, preserving all non-property bytes.
+    pub fn with_instance_property(
+        &self,
+        records: &BTreeSet<usize>,
+        key: &str,
+        value: &str,
+    ) -> Result<Self, String> {
+        if records.iter().any(|&index| !matches!(self.records.get(index).map(|r| &r.kind), Some(RecordKind::Instance { .. }))) {
+            return Err("Selected record is not an instance".into());
+        }
+        self.with_record_property(records, key, value)
+    }
+
+    /// Edit instance or rectangle properties without changing other record bytes.
+    pub fn with_record_property(
+        &self,
+        records: &BTreeSet<usize>,
+        key: &str,
+        value: &str,
+    ) -> Result<Self, String> {
+        if key.trim().is_empty()
+            || key
+                .chars()
+                .any(|c| c.is_whitespace() || c == '=' || c == '{' || c == '}')
+        {
+            return Err("Property name contains unsupported characters".into());
+        }
+        let mut edits = Vec::new();
+        let mut parser = Parser {
+            source: &self.source,
+            pos: 0,
+            diagnostics: Vec::new(),
+            line_starts: std::iter::once(0)
+                .chain(self.source.match_indices('\n').map(|(i, _)| i + 1))
+                .collect(),
+            record_count: 0,
+        };
+        for &index in records {
+            let record = self
+                .records
+                .get(index)
+                .ok_or("Selected record is missing")?;
+            let properties = match &record.kind {
+                RecordKind::Instance { properties, .. }
+                | RecordKind::Rectangle { properties, .. } => properties,
+                _ => return Err("Selected record does not support property editing".into()),
+            };
+            parser.pos = record.span.start;
+            parser.bump();
+            for _ in 0..5 {
+                parser.token().map_err(|e| e.to_string())?;
+            }
+            parser.whitespace();
+            let start = parser.pos;
+            parser.token().map_err(|e| e.to_string())?;
+            let properties = properties.with_value(key, value);
+            let escaped = properties
+                .replace('\\', "\\\\")
+                .replace('{', "\\{")
+                .replace('}', "\\}");
+            edits.push((start..parser.pos, format!("{{{escaped}}}")));
+        }
+        edits.sort_by_key(|(span, _)| span.start);
+        let mut source = String::with_capacity(self.source.len());
+        let mut cursor = 0;
+        for (span, value) in edits {
+            source.push_str(&self.source[cursor..span.start]);
+            source.push_str(&value);
+            cursor = span.end;
+        }
+        source.push_str(&self.source[cursor..]);
+        let end = self.scope.end + source.len() - self.source.len();
+        Self::parse(source[self.scope.start..end].to_owned()).map_err(|e| e.to_string())
     }
     /// Edit only an instance's numeric transform tokens, preserving all other bytes.
     pub fn with_instance_transform(
@@ -696,9 +796,20 @@ impl Parser<'_> {
         if braced {
             self.bump();
             let start = self.pos;
+            let mut depth = 1usize;
             loop {
                 match self.bump() {
-                    Some('}') => break,
+                    Some('{') => {
+                        depth += 1;
+                        value.push('{');
+                    }
+                    Some('}') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        value.push('}');
+                    }
                     Some('\r') => {}
                     Some('\\') => {
                         // Xschem ignores CR even between a backslash and its escaped character.
@@ -1188,6 +1299,20 @@ N0 0 40 0 {lab=signal}
         };
         assert_eq!(text, "a{b} \\ n=n");
         assert_eq!(properties.get("value"), Some("say \"hi\""));
+    }
+    #[test]
+    fn nested_braces_inside_property_blocks_do_not_end_the_record() {
+        let source = "C {sg13.sym} 0 0 0 0 {name=M1\nw={wp}\nl=0.13u\n}\n";
+        let doc = Document::parse(source).unwrap();
+        assert!(doc.diagnostics.is_empty());
+        assert_eq!(doc.records.len(), 1);
+        let RecordKind::Instance { properties, .. } = &doc.records[0].kind else {
+            panic!("instance expected");
+        };
+        assert_eq!(properties.get("name"), Some("M1"));
+        assert_eq!(properties.get("w"), Some("{wp}"));
+        assert_eq!(properties.get("l"), Some("0.13u"));
+        assert_eq!(doc.original(), source);
     }
     #[test]
     fn preserves_embedded_symbols_and_recovers_bad_record() {

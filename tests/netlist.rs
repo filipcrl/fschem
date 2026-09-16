@@ -169,6 +169,15 @@ C {cell.sym} 100 0 0 0 {name=X2}
         "{result}"
     );
     assert!(!result.contains(".tran"));
+    let native_doc = Document::parse(source.replace(
+        "type=subcircuit",
+        "type=subcircuit vacask_format=\"@name (@pinlist) @symname\"",
+    )).unwrap();
+    let native = netlist::vacask(&native_doc, &dir.join("top.sch"), LibraryPaths::default()).unwrap();
+    assert!(native.contains("X1 (net1 net2) cell\nX2 (net3 net4) cell"), "{native}");
+    assert_eq!(native.matches("subckt cell (IN OUT)").count(), 1);
+    assert!(native.contains("R1 (IN OUT) fschem_resistor r=5k\nends"), "{native}");
+    assert!(!native.contains(".tran"));
     std::fs::write(dir.join("cell.sch"), format!("{source}\n{child}")).unwrap();
     let error = netlist::spice(&doc, &dir.join("top.sch"), LibraryPaths::default()).unwrap_err();
     assert!(error.contains("recursive subcircuit"), "{error}");

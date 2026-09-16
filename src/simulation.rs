@@ -1,4 +1,37 @@
-//! Generate a deck and run ngspice without depending on the GUI.
+//! Generate decks and run circuit simulators without depending on the GUI.
+
+mod vacask;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Simulator {
+    #[default]
+    Ngspice,
+    Vacask,
+}
+
+impl Simulator {
+    pub const ALL: [Self; 2] = [Self::Ngspice, Self::Vacask];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ngspice => "ngspice",
+            Self::Vacask => "VACASK",
+        }
+    }
+}
+
+pub fn run_with_simulator(
+    simulator: Simulator,
+    document: &Document,
+    source: &Path,
+    libraries: LibraryPaths,
+    raw: &Path,
+) -> Result<SimulationFiles, String> {
+    match simulator {
+        Simulator::Ngspice => run(document, source, libraries, raw),
+        Simulator::Vacask => vacask::run(document, source, libraries, raw),
+    }
+}
 use crate::{document::Document, library::LibraryPaths, netlist};
 use std::{
     ffi::OsStr,
@@ -13,7 +46,7 @@ pub struct SimulationFiles {
     pub netlist: PathBuf,
     pub raw: PathBuf,
     pub log: PathBuf,
-    /// Non-blocking ngspice startup diagnostics, retained on successful runs.
+    /// Non-blocking simulator diagnostics, retained on successful runs.
     pub warnings: Vec<String>,
 }
 
@@ -219,7 +252,7 @@ impl RunDirectory {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
             let path = parent.join(format!(
-                ".fschem-ngspice-{}-{}",
+                ".fschem-simulation-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));

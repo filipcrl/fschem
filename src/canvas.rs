@@ -46,9 +46,11 @@ pub fn layer_color(layer: u16) -> Color32 {
 /// Triangulate static geometry when loading, not on every mouse movement.
 pub struct PaintCache {
     triangles: Vec<Vec<u32>>,
+    text_segments: Vec<Vec<(Point, Point)>>,
 }
 impl PaintCache {
     pub fn new(scene: &Scene) -> Self {
+        let font = StrokeFont::bundled();
         let triangles = scene
             .items
             .iter()
@@ -70,7 +72,23 @@ impl PaintCache {
                 Vec::new()
             })
             .collect();
-        Self { triangles }
+        let text_segments = scene
+            .items
+            .iter()
+            .map(|item| {
+                if let Shape::Text(run) = &item.shape {
+                    let mut segments = Vec::new();
+                    font.lines(run, |a, b| segments.push((a, b)));
+                    segments
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        Self {
+            triangles,
+            text_segments,
+        }
     }
 }
 
@@ -78,7 +96,6 @@ pub struct Canvas<'a> {
     pub painter: &'a egui::Painter,
     pub rect: Rect,
     pub viewport: Viewport,
-    pub font: &'a StrokeFont,
 }
 impl Canvas<'_> {
     pub fn size(&self) -> Point {
@@ -154,7 +171,8 @@ impl Canvas<'_> {
         show_hidden: bool,
         selected: &BTreeSet<Selection>,
     ) {
-        let visible = self.world_bounds().expanded(100. / self.viewport.zoom);
+        let world_bounds = self.world_bounds();
+        let visible = world_bounds.expanded(100. / self.viewport.zoom);
         let is_selected =
             |item: &fschem::scene::Item| item.selection().is_some_and(|id| selected.contains(&id));
         // Keep scene order within each group, but paint the selection on top.
@@ -199,19 +217,21 @@ impl Canvas<'_> {
                         });
                     }
                     for segment in points.windows(2) {
-                        self.segment(
+                        self.segment_in_bounds(
                             segment[0],
                             segment[1],
                             Stroke::new(width, color),
                             item.style.dash,
+                            world_bounds,
                         );
                     }
                     if *closed && points.len() >= 2 {
-                        self.segment(
+                        self.segment_in_bounds(
                             *points.last().unwrap(),
                             points[0],
                             Stroke::new(width, color),
                             item.style.dash,
+                            world_bounds,
                         );
                     }
                 }
@@ -219,9 +239,15 @@ impl Canvas<'_> {
                     if run.scale.y * self.viewport.zoom * 40. < 3. {
                         continue;
                     }
-                    self.font.lines(run, |a, b| {
-                        self.segment(a, b, Stroke::new(width.min(1.2), color), 0.)
-                    });
+                    for &(a, b) in &cache.text_segments[index] {
+                        self.segment_in_bounds(
+                            a,
+                            b,
+                            Stroke::new(width.min(1.2), color),
+                            0.,
+                            world_bounds,
+                        );
+                    }
                 }
             }
         }
@@ -238,11 +264,13 @@ impl Canvas<'_> {
         );
     }
     fn segment(&self, a: Point, b: Point, stroke: Stroke, dash: f64) {
+        self.segment_in_bounds(a, b, stroke, dash, self.world_bounds());
+    }
+    fn segment_in_bounds(&self, a: Point, b: Point, stroke: Stroke, dash: f64, bounds: Bounds) {
         let Some((start, end)) = clip_segment(
             a,
             b,
-            self.world_bounds()
-                .expanded(stroke.width as f64 / self.viewport.zoom),
+            bounds.expanded(stroke.width as f64 / self.viewport.zoom),
         ) else {
             return;
         };

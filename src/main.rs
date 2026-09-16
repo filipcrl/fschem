@@ -1,7 +1,9 @@
 mod canvas;
+mod graph;
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)] // AppKit's Objective-C target/action bridge is isolated here.
 mod macos_menu;
+mod schematic_graphs;
 mod viewer;
 mod waveform_lod;
 mod waveforms;
@@ -36,12 +38,15 @@ fn run() -> Result<(), String> {
     let mut smoke_test = false;
     let mut screenshot = None;
     let mut netlist = None;
+    let mut netlist_format = None;
+    let mut simulate = None;
+    let mut simulator = None;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--help" | "-h") => {
                 println!(
-                    "fschem [OPTIONS] [FILE.sch|FILE.sym]\n\n  -L, --library DIR  Add a symbol library search path (repeatable)\n  --netlist OUTPUT  Export FILE.sch as a SPICE deck without opening a window\n  --check PATH...   Check file syntax and lossless retention; recurse through directories\n  --verbose        Show all parser diagnostics in check mode\n  --smoke-test     Open, render three frames, then exit (demo if no file given)\n  --screenshot PNG Capture the egui window after loading\n\nCtrl/Command-O opens; Ctrl/Command-S saves; Ctrl/Command-Z undoes; Ctrl/Command-Shift-Z redoes.\nClick/Shift-click or left-drag selects; G moves; C copies; W wires; Backspace deletes.\nR/X/Y rotate or mirror while moving; left-click places; Esc cancels.\nMiddle/right-drag pans; wheel/pinch zooms; F fits. i: symbol, e: schematic, Shift-E: up.\nFile → Export SPICE netlist exports the current schematic.\nThe stroke font is built in. Source schematic files change only when saved."
+                    "fschem [OPTIONS] [FILE.sch|FILE.sym]\n\n  -L, --library DIR  Add a symbol library search path (repeatable)\n  --netlist OUTPUT  Export a netlist without opening a window\n  --netlist-format FORMAT\n                   Netlist format: spice (default) or vacask\n  --simulate RAW   Run FILE.sch headlessly; save .raw, netlist and .log files\n  --simulator NAME Simulator for --simulate: ngspice (default) or vacask\n  --check PATH...   Check file syntax and lossless retention; recurse through directories\n  --verbose        Show all parser diagnostics in check mode\n  --smoke-test     Open, render three frames, then exit (demo if no file given)\n  --screenshot PNG Capture the egui window after loading\n\nCtrl/Command-O opens; Ctrl/Command-S saves; Ctrl/Command-Z undoes; Ctrl/Command-Shift-Z redoes.\nClick/Shift-click or left-drag selects; G moves; C copies; W wires; Backspace deletes.\nR/X/Y rotate or mirror while moving; left-click places; Esc cancels.\nMiddle/right-drag pans; wheel/pinch zooms; F fits. i: symbol, e: schematic, Shift-E: up.\nFile → Export SPICE netlist exports the current schematic.\nThe stroke font is built in. Source schematic files change only when saved."
                 );
                 return Ok(());
             }
@@ -53,6 +58,44 @@ fn run() -> Result<(), String> {
                 netlist = Some(PathBuf::from(
                     args.next().ok_or("--netlist requires an output path")?,
                 ));
+            }
+            Some("--netlist-format") => {
+                let value = args
+                    .next()
+                    .ok_or("--netlist-format requires spice or vacask")?;
+                netlist_format = Some(
+                    match value.to_str().map(str::to_ascii_lowercase).as_deref() {
+                        Some("spice" | "ngspice") => fschem::simulation::Simulator::Ngspice,
+                        Some("vacask") => fschem::simulation::Simulator::Vacask,
+                        _ => {
+                            return Err(format!(
+                                "unknown netlist format {value:?}; choose spice or vacask"
+                            ));
+                        }
+                    },
+                );
+            }
+            Some("--simulate") => {
+                simulate = Some(PathBuf::from(
+                    args.next()
+                        .ok_or("--simulate requires an output .raw path")?,
+                ));
+            }
+            Some("--simulator") => {
+                let value = args
+                    .next()
+                    .ok_or("--simulator requires ngspice or vacask")?;
+                simulator = Some(
+                    match value.to_str().map(str::to_ascii_lowercase).as_deref() {
+                        Some("ngspice") => fschem::simulation::Simulator::Ngspice,
+                        Some("vacask") => fschem::simulation::Simulator::Vacask,
+                        _ => {
+                            return Err(format!(
+                                "unknown simulator {value:?}; choose ngspice or vacask"
+                            ));
+                        }
+                    },
+                );
             }
             Some("--verbose") => verbose = true,
             Some("--smoke-test") => smoke_test = true,
@@ -72,18 +115,69 @@ fn run() -> Result<(), String> {
             _ => inputs.push(PathBuf::from(arg)),
         }
     }
-    if let Some(output) = netlist {
+    if netlist_format.is_some() && netlist.is_none() {
+        return Err("--netlist-format requires --netlist OUTPUT; simulation uses its simulator's native format".into());
+    }
+    if simulator.is_some() && simulate.is_none() {
+        return Err("--simulator requires --simulate OUTPUT.raw".into());
+    }
+    if netlist.is_some() && simulate.is_some() {
+        return Err("--netlist and --simulate are separate modes; --simulate already saves its generated netlist".into());
+    }
+    if netlist.is_some() || simulate.is_some() {
         if check || smoke_test || screenshot.is_some() || inputs.len() != 1 {
-            return Err("--netlist OUTPUT requires one input schematic and cannot be combined with --check, --smoke-test or --screenshot".into());
+            return Err("--netlist and --simulate require one input schematic and cannot be combined with --check, --smoke-test or --screenshot".into());
         }
-        let input = std::fs::canonicalize(&inputs[0]).map_err(|e| e.to_string())?;
-        if std::fs::canonicalize(&output).ok().as_ref() == Some(&input) {
-            return Err("netlist output must differ from the source schematic".into());
-        }
+        let input = std::fs::canonicalize(&inputs[0])
+            .map_err(|e| format!("{}: {e}", inputs[0].display()))?;
         let doc = read_document(&input)?;
-        let deck = fschem::netlist::spice(&doc, &input, LibraryPaths::discover(roots))?;
-        fschem::netlist::write_spice(&output, &deck)?;
-        println!("Exported SPICE netlist to {}", output.display());
+        let libraries = LibraryPaths::discover(roots);
+        if let Some(output) = netlist {
+            protect_source(&input, &output)?;
+            let format = netlist_format.unwrap_or_default();
+            let deck = match format {
+                fschem::simulation::Simulator::Ngspice => {
+                    fschem::netlist::spice(&doc, &input, libraries)?
+                }
+                fschem::simulation::Simulator::Vacask => {
+                    fschem::netlist::vacask(&doc, &input, libraries)?
+                }
+            };
+            fschem::netlist::write_spice(&output, &deck)?;
+            println!(
+                "Exported {} netlist to {}",
+                match format {
+                    fschem::simulation::Simulator::Ngspice => "SPICE",
+                    fschem::simulation::Simulator::Vacask => "VACASK",
+                },
+                output.display()
+            );
+        } else if let Some(output) = simulate {
+            let simulator = simulator.unwrap_or_default();
+            for path in [
+                output.clone(),
+                output.with_extension("log"),
+                output.with_extension(match simulator {
+                    fschem::simulation::Simulator::Ngspice => "spice",
+                    fschem::simulation::Simulator::Vacask => "sim",
+                }),
+            ] {
+                protect_source(&input, &path)?;
+            }
+            let files = fschem::simulation::run_with_simulator(
+                simulator, &doc, &input, libraries, &output,
+            )?;
+            println!(
+                "{} simulation complete\nRaw: {}\nNetlist: {}\nLog: {}",
+                simulator.name(),
+                files.raw.display(),
+                files.netlist.display(),
+                files.log.display()
+            );
+            for warning in files.warnings {
+                eprintln!("Warning: {warning}");
+            }
+        }
         return Ok(());
     }
     if check {
@@ -126,6 +220,16 @@ fn run() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     if smoke_test && !success.load(Ordering::Relaxed) {
         return Err("viewer smoke test did not finish successfully".into());
+    }
+    Ok(())
+}
+
+fn protect_source(input: &Path, output: &Path) -> Result<(), String> {
+    if std::fs::canonicalize(output).ok().as_deref() == Some(input) {
+        return Err(format!(
+            "output {} must differ from the source schematic",
+            output.display()
+        ));
     }
     Ok(())
 }

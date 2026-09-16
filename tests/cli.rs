@@ -1,0 +1,244 @@
+#![cfg(feature = "gui")]
+
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Output, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+struct Workspace(PathBuf);
+impl Workspace {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "fschem-cli-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::write(
+            path.join("spice.sch"),
+            include_str!("../examples/spice.sch"),
+        )
+        .unwrap();
+        fs::write(
+            path.join("vacask.sch"),
+            include_str!("../examples/vacask.sch"),
+        )
+        .unwrap();
+        Self(path)
+    }
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fschem"));
+        cmd.current_dir(&self.0).stdin(Stdio::null());
+        cmd
+    }
+    fn run(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().unwrap()
+    }
+}
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+fn success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn exports_both_formats_without_a_window() {
+    let dir = Workspace::new();
+    success(&dir.run(&["--netlist", "default.spice", "spice.sch"]));
+    success(&dir.run(&[
+        "spice.sch",
+        "--netlist-format",
+        "spice",
+        "--netlist",
+        "explicit.spice",
+    ]));
+    assert_eq!(
+        fs::read(dir.0.join("default.spice")).unwrap(),
+        fs::read(dir.0.join("explicit.spice")).unwrap()
+    );
+    let spice = fs::read_to_string(dir.0.join("default.spice")).unwrap();
+    assert!(spice.contains("R1 VIN VOUT 10k"));
+    assert!(spice.ends_with(".end\n"));
+    success(&dir.run(&[
+        "--netlist-format",
+        "VACASK",
+        "--netlist",
+        "native deck.sim",
+        "vacask.sch",
+    ]));
+    let native = fs::read_to_string(dir.0.join("native deck.sim")).unwrap();
+    assert!(native.contains("R1 (VIN VOUT) fschem_resistor r=10k"));
+    assert!(native.contains("analysis op1 op"));
+    assert!(!native.contains(".end"));
+}
+
+#[test]
+fn invalid_options_and_output_collisions_fail_before_writing() {
+    let dir = Workspace::new();
+    for args in [
+        vec!["--netlist-format"],
+        vec!["--simulator"],
+        vec!["--simulate"],
+        vec![
+            "--netlist-format",
+            "bogus",
+            "--netlist",
+            "out.sim",
+            "spice.sch",
+        ],
+        vec!["--simulator", "bogus", "--simulate", "out.raw", "spice.sch"],
+        vec!["--netlist-format", "vacask", "spice.sch"],
+        vec!["--simulator", "vacask", "spice.sch"],
+        vec!["--netlist", "out.sim", "--simulate", "out.raw", "spice.sch"],
+        vec!["--simulate", "out.raw", "--check", "spice.sch"],
+        vec!["--simulate", "out.raw", "--smoke-test", "spice.sch"],
+        vec![
+            "--simulate",
+            "out.raw",
+            "--screenshot",
+            "out.png",
+            "spice.sch",
+        ],
+        vec!["--simulate", "out.raw"],
+        vec!["--simulate", "out.raw", "spice.sch", "vacask.sch"],
+        vec!["--netlist", "spice.sch", "spice.sch"],
+        vec!["--simulate", "spice.sch", "spice.sch"],
+        vec!["--simulate", "out.txt", "spice.sch"],
+    ] {
+        let output = dir.run(&args);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(!output.stderr.is_empty(), "{args:?}");
+    }
+    assert_eq!(
+        fs::read_to_string(dir.0.join("spice.sch")).unwrap(),
+        include_str!("../examples/spice.sch")
+    );
+    assert!(!dir.0.join("out.raw").exists());
+    assert!(!dir.0.join("out.sim").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn simulator_selection_runs_the_matching_backend_and_reports_failures() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let dir = Workspace::new();
+    let bin = dir.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let raw = "Title: test\nPlotname: Operating Point\nFlags: real\nNo. Variables: 1\nNo. Points: 1\nVariables:\n0 VOUT notype\nValues:\n0 2\n";
+    for (program, script) in [
+        (
+            "ngspice",
+            format!(
+                "#!/bin/sh\nset -eu\ntest \"$1\" = -b\ntest \"$2\" = -r\nprintf '{raw}' > \"$3\"\necho ngspice-ran\n"
+            ),
+        ),
+        (
+            "vacask",
+            format!(
+                "#!/bin/sh\nset -eu\ntest \"$1\" = -qp\ntest \"$2\" = -sp\nprintf '{raw}' > op.raw\necho vacask-ran\n"
+            ),
+        ),
+    ] {
+        let path = bin.join(program);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for (simulator, schematic, extension) in [
+        ("ngspice", "spice.sch", "spice"),
+        ("vacask", "vacask.sch", "sim"),
+    ] {
+        let result = dir
+            .command()
+            .env("PATH", &bin)
+            .args([
+                "--simulate",
+                "result.raw",
+                "--simulator",
+                simulator,
+                schematic,
+            ])
+            .output()
+            .unwrap();
+        success(&result);
+        assert!(String::from_utf8_lossy(&result.stdout).contains("simulation complete"));
+        assert!(dir.0.join(format!("result.{extension}")).is_file());
+        assert!(
+            fs::read_to_string(dir.0.join("result.log"))
+                .unwrap()
+                .contains(&format!("{simulator}-ran"))
+        );
+        assert_eq!(
+            fschem::raw::RawFile::open(&dir.0.join("result.raw"))
+                .unwrap()
+                .plots
+                .len(),
+            1
+        );
+    }
+    // No selector retains the historical ngspice default.
+    success(
+        &dir.command()
+            .env("PATH", &bin)
+            .args(["--simulate", "default.raw", "spice.sch"])
+            .output()
+            .unwrap(),
+    );
+    assert!(dir.0.join("default.spice").exists());
+    fs::remove_file(bin.join("vacask")).unwrap();
+    let before = fs::read(dir.0.join("result.raw")).unwrap();
+    let result = dir
+        .command()
+        .env("PATH", &bin)
+        .args([
+            "--simulate",
+            "result.raw",
+            "--simulator",
+            "vacask",
+            "vacask.sch",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Could not start VACASK"));
+    assert_eq!(fs::read(dir.0.join("result.raw")).unwrap(), before);
+    // Protect the input even when a generated companion file is a symlink to it.
+    symlink(dir.0.join("vacask.sch"), dir.0.join("danger.sim")).unwrap();
+    let result = dir.run(&[
+        "--simulate",
+        "danger.raw",
+        "--simulator",
+        "vacask",
+        "vacask.sch",
+    ]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("must differ"));
+    assert_eq!(
+        fs::read_to_string(dir.0.join("vacask.sch")).unwrap(),
+        include_str!("../examples/vacask.sch")
+    );
+}
+
+#[test]
+#[ignore = "requires ngspice and vacask on PATH"]
+fn real_simulators_run_from_the_cli() {
+    let dir = Workspace::new();
+    // Keep this divider independent of the user's PDK startup configuration.
+    fs::write(dir.0.join(".spiceinit"), "").unwrap();
+    for (simulator, input) in [("ngspice", "spice.sch"), ("vacask", "vacask.sch")] {
+        let raw = format!("{simulator}.raw");
+        success(&dir.run(&["--simulator", simulator, "--simulate", &raw, input]));
+        let data = fschem::raw::RawFile::open(&dir.0.join(raw)).unwrap();
+        assert!(!data.plots.is_empty());
+    }
+}

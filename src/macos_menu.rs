@@ -14,9 +14,13 @@ pub enum Command {
     Open,
     Save,
     SaveAs,
+    CloseTab,
+    Quit,
     Demo,
     Reload,
     ExportSpice,
+    Simulate,
+    Simulator(fschem::simulation::Simulator),
     Fit,
     Grid,
     Hidden,
@@ -61,6 +65,11 @@ define_class!(
                 13 => Command::Save,
                 14 => Command::SaveAs,
                 15 => Command::Fps,
+                16 => Command::CloseTab,
+                17 => Command::Quit,
+                18 => Command::Simulator(fschem::simulation::Simulator::Ngspice),
+                19 => Command::Simulator(fschem::simulation::Simulator::Vacask),
+                20 => Command::Simulate,
                 100 => Command::Edit(egui::Key::G),
                 101 => Command::Edit(egui::Key::C),
                 102 => Command::Edit(egui::Key::Backspace),
@@ -100,6 +109,19 @@ impl NativeMenu {
         let main = app
             .mainMenu()
             .expect("eframe must initialize the application menu first");
+        // Route the application menu's Quit through eframe's cancellable close
+        // request instead of AppKit's immediate terminate: action.
+        if let Some(app_menu) = main.itemAtIndex(0).and_then(|item| item.submenu()) {
+            for item in app_menu.itemArray() {
+                if item.action() == Some(sel!(terminate:)) {
+                    item.setTag(17);
+                    unsafe {
+                        item.setAction(Some(sel!(performMenuCommand:)));
+                        item.setTarget(Some(&handler));
+                    }
+                }
+            }
+        }
         let mut items = Vec::new();
         for (title, entries) in [
             (
@@ -108,6 +130,7 @@ impl NativeMenu {
                     ("Open…", "o", 0),
                     ("Save", "s", 13),
                     ("Save As…", "s", 14),
+                    ("Close tab", "w", 16),
                     ("Built-in demonstration", "", 1),
                     ("Reload", "r", 2),
                     ("Export SPICE netlist…", "", 12),
@@ -148,6 +171,10 @@ impl NativeMenu {
                     ("Up one level (Shift-E)", "", 11),
                 ],
             ),
+            (
+                "Simulator",
+                vec![("ngspice", "", 18), ("VACASK", "", 19), ("Run…", "", 20)],
+            ),
         ] {
             let menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str(title));
             menu.setAutoenablesItems(false);
@@ -182,7 +209,8 @@ impl NativeMenu {
                     "File" => 1,
                     "Edit" => 2,
                     "View" => 3,
-                    _ => 4,
+                    "Navigate" => 4,
+                    _ => 5,
                 },
             );
         }
@@ -196,6 +224,17 @@ impl NativeMenu {
     pub fn commands(&self) -> Vec<Command> {
         self.receiver.try_iter().collect()
     }
+    pub fn sync_simulator(&self, simulator: fschem::simulation::Simulator) {
+        for item in &self.items {
+            let selected = match item.tag() {
+                18 => simulator == fschem::simulation::Simulator::Ngspice,
+                19 => simulator == fschem::simulation::Simulator::Vacask,
+                _ => continue,
+            };
+            item.setState(if selected { 1 } else { 0 });
+        }
+    }
+
     pub fn sync_history(&self, undo: Option<&str>, redo: Option<&str>) {
         for item in &self.items {
             let (action, label) = match item.tag() {
@@ -222,7 +261,7 @@ impl NativeMenu {
         for item in &self.items {
             match item.tag() {
                 2 | 3 => item.setEnabled(document),
-                12 => item.setEnabled(export),
+                12 | 20 => item.setEnabled(export),
                 13 | 14 => item.setEnabled(edit[1]),
                 100..=102 => item.setEnabled(edit[0]),
                 103 => item.setEnabled(edit[1]),
