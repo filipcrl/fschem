@@ -59,7 +59,14 @@ impl FileStamp {
         })
     }
 }
+fn session_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 struct DocumentView {
+    identity: u64,
+    record_ids: Vec<u64>,
+    identity_history: Vec<(Arc<Document>, Vec<u64>)>,
     loaded: Arc<LoadedDocument>,
     saved: Arc<Document>,
     file_stamp: Option<FileStamp>,
@@ -98,6 +105,9 @@ impl DocumentView {
         let target = loaded.path.clone().map(DocumentTarget::File);
         let file_stamp = loaded.path.as_deref().and_then(FileStamp::read);
         Self {
+            identity: session_id(),
+            record_ids: loaded.document.records.iter().map(|_| session_id()).collect(),
+            identity_history: Vec::new(),
             saved: Arc::clone(&loaded.document),
             file_stamp,
             layers: loaded
@@ -214,6 +224,12 @@ impl DocumentView {
         if self.loaded.document.original() != state.document.original() {
             self.install_document((*state.document).clone(), paths)?;
         }
+        if let Some((_, ids)) = self.identity_history.iter().find(|(doc, _)| Arc::ptr_eq(doc, &state.document)) {
+            self.record_ids = ids.clone();
+        } else {
+            self.record_ids.resize_with(state.document.records.len(), session_id);
+            self.identity_history.push((state.document.clone(), self.record_ids.clone()));
+        }
         self.layers
             .retain(|layer, _| self.loaded.scene.layers.contains_key(layer));
         self.select_records(&state.selection);
@@ -225,11 +241,22 @@ impl DocumentView {
         before: EditState,
         paths: &LibraryPaths,
     ) -> Result<(), String> {
+        let old_ids = self.record_ids.clone();
+        self.identity_history.push((before.document.clone(), old_ids.clone()));
+        if matches!(&operation, EditOperation::Delete) {
+            self.record_ids = if before.document.records.iter().any(|record| matches!(record.kind, RecordKind::Embedded(_))) {
+                // Deleting an embedded owner can relocate definition records. Never guess indices.
+                Vec::new()
+            } else {
+                old_ids.iter().enumerate().filter_map(|(i, id)| (!before.selection.contains(&i)).then_some(*id)).collect()
+            };
+        }
         let mut history = std::mem::take(&mut self.history);
         let result = history.execute(Box::new(DocumentCommand::new(operation, before)), |state| {
             self.apply_edit_state(state, paths)
         });
         self.history = history;
+        if result.is_err() { self.record_ids = old_ids; }
         result
     }
     fn undo(&mut self, paths: &LibraryPaths) -> Result<(), String> {
@@ -532,6 +559,22 @@ impl DocumentView {
                 _ => None,
             })
             .collect()
+    }
+    fn graph_properties(&self, index: usize) -> Option<&fschem::document::Properties> {
+        match &self.loaded.document.records.get(index)?.kind {
+            RecordKind::Rectangle { properties, .. } if properties.get("flags").is_some_and(|f| f.split_whitespace().any(|f| f == "graph")) => Some(properties),
+            _ => None,
+        }
+    }
+    fn graph_at(&self, pointer: Option<Point>) -> Option<usize> {
+        self.selected_graph_records().first().copied().or_else(|| {
+            let p = pointer?;
+            self.loaded.document.records.iter().enumerate().rev().find_map(|(index, record)| {
+                if self.graph_properties(index).is_none() { return None; }
+                let RecordKind::Rectangle { a, b, layer, .. } = &record.kind else { return None; };
+                (self.layers.get(layer) != Some(&false) && p.x >= a.x.min(b.x) && p.x <= a.x.max(b.x) && p.y >= a.y.min(b.y) && p.y <= a.y.max(b.y)).then_some(index)
+            })
+        })
     }
     fn selected_graph_records(&self) -> BTreeSet<usize> {
         self.selected.iter().filter_map(|selection| {
@@ -1561,6 +1604,17 @@ impl Viewer {
                 }
             }
             Action::Descend(kind) => {
+                if matches!(kind, Descent::Schematic) && self.loading.is_none() {
+                    if let Some(current) = &self.current {
+                        if current.moving.is_none() && let Some(index) = current.graph_at(self.pointer) {
+                            let properties = current.graph_properties(index).unwrap().clone();
+                            if let Some(path) = crate::schematic_graphs::raw_path(current.loaded.path.as_deref(), &properties) {
+                                self.waveforms.open_graph(ctx, crate::waveforms::GraphTarget { document: current.identity, record: current.record_ids[index] }, path, properties);
+                            } else { self.error = Some("Save the schematic or set graph rawfile first.".into()); }
+                            return;
+                        }
+                    }
+                }
                 if self.loading.is_some() {
                     return;
                 }
@@ -1587,7 +1641,30 @@ impl Viewer {
         }
         ctx.request_repaint();
     }
+    fn sync_linked_graph(&mut self, ctx: &egui::Context) {
+        let views = self.current.iter_mut().chain(self.navigation_stack.iter_mut())
+            .chain(self.tabs.iter_mut().flat_map(|tab| tab.current.iter_mut().chain(tab.stack.iter_mut())));
+        let mut views: Vec<_> = views.collect();
+        let paths = &self.paths;
+        let error = &mut self.error;
+        self.waveforms.sync_graph(ctx, |target, previous, edits| {
+            let view = views.iter_mut().find(|view| view.identity == target.document)?;
+            let index = view.record_ids.iter().position(|id| *id == target.record)?;
+            let properties = view.graph_properties(index)?;
+            // A schematic edit/undo wins over a queued viewport edit from an older snapshot.
+            if properties.raw == previous.raw && !edits.is_empty() && view.moving.is_none() {
+                let selection = view.selected.clone();
+                let before = EditState { document: view.loaded.document.clone(), selection: BTreeSet::from([index]) };
+                if let Err(message) = view.execute_command(EditOperation::SetGraphConfiguration { properties: edits }, before, paths) { *error = Some(message); }
+                view.selected = selection;
+            }
+            let properties = view.graph_properties(index)?.clone();
+            let path = crate::schematic_graphs::raw_path(view.loaded.path.as_deref(), &properties)?;
+            Some((path, properties))
+        });
+    }
     fn show(&mut self, ctx: &egui::Context) {
+        self.sync_linked_graph(ctx);
         self.poll(ctx);
         if self.show_fps {
             let dt = ctx.input(|input| input.unstable_dt);
@@ -2614,7 +2691,7 @@ fn graph_properties_ui(
         ui.weak(format!("{} graphs · edits apply to all selected graphs", graphs.len()));
     }
     ui.weak("Raw file: absolute path or relative to the schematic. Leave empty to use the schematic's .raw file.");
-    let mut keys: BTreeSet<String> = ["rawfile", "node", "dataset", "x1", "x2", "y1", "y2", "logx"]
+    let mut keys: BTreeSet<String> = ["rawfile", "node", "dataset", "x1", "x2", "y1", "y2", "logx", "groupmode", "mode"]
         .into_iter().map(str::to_owned).collect();
     for props in graphs {
         keys.extend(props.entries.iter().map(|(key, _)| key.clone()));

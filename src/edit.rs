@@ -42,6 +42,7 @@ pub enum EditOperation {
     Wire { start: Point, end: Point },
     SetInstanceProperty { key: String, value: String },
     SetRecordProperty { key: String, value: String },
+    SetGraphConfiguration { properties: std::collections::BTreeMap<String, String> },
 }
 
 /// A command prepares its result; the receiver installs it before history changes.
@@ -68,6 +69,7 @@ impl DocumentCommand {
 impl EditCommand for DocumentCommand {
     fn label(&self) -> &'static str {
         match self.operation {
+            EditOperation::SetGraphConfiguration { .. } => "Edit graph",
             EditOperation::Move(_) => "Move",
             EditOperation::Copy(_) => "Copy",
             EditOperation::Delete => "Delete",
@@ -80,6 +82,11 @@ impl EditCommand for DocumentCommand {
         if self.after.is_none() {
             let mut state = self.before.clone();
             match self.operation {
+                EditOperation::SetGraphConfiguration { ref properties } => {
+                    for (key, value) in properties {
+                        state.document = Arc::new(state.document.with_record_property(&state.selection, key, value)?);
+                    }
+                }
                 EditOperation::Move(placement) => placement.apply(&mut state)?,
                 EditOperation::Copy(placement) => {
                     if !state.selection.is_empty() {

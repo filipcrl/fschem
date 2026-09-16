@@ -7,6 +7,17 @@ use std::{
     sync::{Arc, Mutex, mpsc},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GraphTarget {
+    pub document: u64,
+    pub record: u64,
+}
+struct GraphLink {
+    target: GraphTarget,
+    properties: fschem::document::Properties,
+    pending: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Default)]
 pub struct Waveforms {
     state: Arc<Mutex<WindowState>>,
@@ -19,6 +30,32 @@ fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("fschem-waveforms")
 }
 impl Waveforms {
+    pub(crate) fn open_graph(&mut self, ctx: &egui::Context, target: GraphTarget, path: PathBuf, properties: fschem::document::Properties) {
+        let mut state = self.state.lock().unwrap();
+        state.data = None;
+        state.load_selected(ctx, path, None);
+        state.link = Some(GraphLink { target, properties, pending: Default::default() });
+        state.detached = false;
+    }
+    /// The owner validates identity and the source snapshot before accepting queued changes.
+    pub(crate) fn sync_graph(&mut self, ctx: &egui::Context, mut sync: impl FnMut(GraphTarget, &fschem::document::Properties, std::collections::BTreeMap<String, String>) -> Option<(PathBuf, fschem::document::Properties)>) {
+        let mut state = self.state.lock().unwrap();
+        let Some(mut link) = state.link.take() else { return; };
+        if !state.open { return; }
+        let Some((path, properties)) = sync(link.target, &link.properties, std::mem::take(&mut link.pending)) else {
+            state.detached = true;
+            return;
+        };
+        if state.watched.as_ref() != Some(&path) {
+            state.data = None;
+            state.load_selected(ctx, path, None);
+        } else if properties.raw != link.properties.raw {
+            if let Some(data) = &mut state.data { data.configure(&properties); }
+        }
+        link.properties = properties;
+        state.link = Some(link);
+    }
+
     pub fn open_dialog(&mut self, ctx: &egui::Context) {
         self.state.lock().unwrap().open_dialog(ctx);
     }
@@ -27,6 +64,8 @@ impl Waveforms {
     }
     pub fn load_plot(&mut self, ctx: &egui::Context, path: PathBuf, plot: usize) {
         let mut state = self.state.lock().unwrap();
+        state.link = None;
+        state.detached = false;
         state.data = None; // Explicit analysis selection must not restore another plot.
         state.load_selected(ctx, path, Some(plot));
     }
@@ -81,6 +120,8 @@ impl Waveforms {
 
 #[derive(Default)]
 struct WindowState {
+    link: Option<GraphLink>,
+    detached: bool,
     open: bool,
     data: Option<Display>,
     loading: Option<mpsc::Receiver<Result<Display, String>>>,
@@ -104,6 +145,8 @@ impl WindowState {
     }
 
     pub fn load(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.link = None;
+        self.detached = false;
         self.load_selected(ctx, path, None);
     }
     fn load_selected(&mut self, ctx: &egui::Context, path: PathBuf, plot: Option<usize>) {
@@ -144,6 +187,7 @@ impl WindowState {
                     {
                         data.restore_view(previous);
                     }
+                    if let Some(link) = &self.link { data.configure(&link.properties); }
                     self.data = Some(data);
                 }
                 Err(error) => self.error = Some(error),
@@ -195,7 +239,24 @@ impl WindowState {
             ui.label("Open a raw file, or run a simulation from the schematic toolbar.");
             return;
         };
+        if self.link.is_some() { ui.weak("Linked schematic graph · edits update the document (not disk)"); }
+        if self.detached { ui.weak("Unlinked graph · source closed, reloaded or removed. Press E on a graph to reconnect."); }
+        let before = data.configuration();
+        let before_range = data.x_range();
         data.ui(ui);
+        let after = data.configuration();
+        if let Some(link) = &mut self.link {
+            if before_range.is_some() && before_range != data.x_range() {
+                if let Some((a, b)) = data.x_range() {
+                    link.pending.insert("x1".into(), a.to_string());
+                    link.pending.insert("x2".into(), b.to_string());
+                }
+            }
+            for (key, value) in after {
+                if before.get(&key) != Some(&value) { link.pending.insert(key, value); }
+            }
+            if !link.pending.is_empty() { ui.ctx().request_repaint_of(egui::ViewportId::ROOT); }
+        }
     }
 }
 

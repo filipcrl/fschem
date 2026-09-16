@@ -80,7 +80,7 @@ impl Binding {
     }
 }
 
-fn raw_path(document: Option<&Path>, props: &Properties) -> Option<PathBuf> {
+pub(crate) fn raw_path(document: Option<&Path>, props: &Properties) -> Option<PathBuf> {
     if let Some(file) = props.get("rawfile").filter(|s| !s.trim().is_empty()) {
         let path = PathBuf::from(file);
         return Some(if path.is_absolute() {

@@ -126,6 +126,7 @@ pub(crate) struct Display {
     log_x: bool,
     fit: bool,
     x_range: Option<(f64, f64)>,
+    y_range: Option<(f64, f64)>,
     group_mode: GroupMode,
     timeline_dragging: bool,
     dirty: bool,
@@ -161,6 +162,7 @@ impl Display {
             log_x: false,
             fit: true,
             x_range: None,
+            y_range: None,
             group_mode: GroupMode::Overlay,
             timeline_dragging: false,
             dirty: true,
@@ -229,6 +231,7 @@ impl Display {
         self.log_x = previous.log_x;
         self.group_mode = previous.group_mode;
         self.x_range = previous.x_range;
+        self.y_range = previous.y_range;
         self.fit = previous.fit;
         self.filter = previous.filter.clone();
         self.selected = self.raw.plots[self.plot]
@@ -274,7 +277,42 @@ impl Display {
         if let Some(log) = props.get("logx") {
             self.log_x = log == "1";
         }
+        self.group_mode = match props.get("groupmode") {
+            Some("separate") => GroupMode::Separate,
+            Some("unit") => GroupMode::ByUnit,
+            _ => GroupMode::Overlay,
+        };
+        self.mode = match props.get("mode") {
+            Some("imaginary") => Mode::Imaginary,
+            Some("magnitude") => Mode::Magnitude,
+            Some("decibels") => Mode::Decibels,
+            Some("phase") => Mode::Phase,
+            Some("real") => Mode::Real,
+            _ => self.mode,
+        };
+        self.x_range = props.get("x1").and_then(|s| s.parse::<f64>().ok())
+            .zip(props.get("x2").and_then(|s| s.parse::<f64>().ok()))
+            .filter(|(a,b)| a.is_finite() && b.is_finite() && a < b);
+        self.y_range = props.get("y1").and_then(|s| s.parse::<f64>().ok())
+            .zip(props.get("y2").and_then(|s| s.parse::<f64>().ok()))
+            .filter(|(a,b)| a.is_finite() && b.is_finite() && a < b);
+        self.fit = self.x_range.is_none();
         self.dirty = true;
+    }
+
+    pub(crate) fn x_range(&self) -> Option<(f64, f64)> { self.x_range }
+
+    /// Only properties owned by waveform controls; unrelated graph fields survive edits.
+    pub(crate) fn configuration(&self) -> BTreeMap<String, String> {
+        let nodes = self.raw.plots[self.plot].variables.iter().zip(&self.selected)
+            .filter(|(_, selected)| **selected).map(|(v, _)| v.name.as_str()).collect::<Vec<_>>().join(" ");
+        BTreeMap::from([
+            ("dataset".into(), self.plot.to_string()),
+            ("node".into(), nodes),
+            ("logx".into(), if self.log_x { "1" } else { "0" }.into()),
+            ("groupmode".into(), match self.group_mode { GroupMode::Overlay => "overlay", GroupMode::ByUnit => "unit", GroupMode::Separate => "separate" }.into()),
+            ("mode".into(), match self.mode { Mode::Real => "real", Mode::Imaginary => "imaginary", Mode::Magnitude => "magnitude", Mode::Decibels => "decibels", Mode::Phase => "phase" }.into()),
+        ])
     }
 
     /// Paint without allocating interactive widgets: schematic editing owns gestures.
@@ -285,6 +323,22 @@ impl Display {
         rect: Rect,
         props: &fschem::document::Properties,
     ) {
+        self.prepare_traces(ui.ctx());
+        if self.group_mode == GroupMode::Separate && self.selected.iter().any(|s| *s) {
+            let selected = self.selected.clone();
+            let indices: Vec<_> = selected.iter().enumerate().filter_map(|(i, s)| s.then_some(i)).collect();
+            self.group_mode = GroupMode::Overlay;
+            for (row, index) in indices.iter().enumerate() {
+                self.selected.fill(false);
+                self.selected[*index] = true;
+                let height = rect.height() / indices.len() as f32;
+                let panel = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + row as f32 * height), Pos2::new(rect.right(), rect.top() + (row + 1) as f32 * height));
+                self.paint_embedded(ui, panel, props);
+            }
+            self.selected = selected;
+            self.group_mode = GroupMode::Separate;
+            return;
+        }
         self.prepare_traces(ui.ctx());
         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
         painter.rect_filled(rect, 0., Color32::from_rgb(18, 20, 24));
@@ -375,6 +429,7 @@ impl Display {
         self.dirty = true;
         self.fit = true;
         self.x_range = None;
+        self.y_range = None;
     }
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui) {
         ui.label(self.path.display().to_string());
@@ -853,6 +908,7 @@ impl Display {
         }
     }
     fn group_bounds(&self, group: &[usize]) -> (f64, f64) {
+        if let Some(range) = self.y_range { return range; }
         let mut min = f64::INFINITY;
         let mut max = f64::NEG_INFINITY;
         for &i in group {
@@ -912,7 +968,7 @@ impl Display {
         {
             self.preparing = None;
             self.traces.extend(traces.into_iter().map(|t| (t.index, t)));
-            self.fit = true;
+            self.fit = self.x_range.is_none();
             self.dirty = true;
         }
         if !self.dirty {
