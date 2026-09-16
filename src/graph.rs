@@ -341,12 +341,12 @@ impl Display {
         self.prepare_traces(ui.ctx());
         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
         painter.rect_filled(rect, 0., Color32::from_rgb(18, 20, 24));
-        if rect.width() < 150. || rect.height() < 85. {
+        if rect.width() < 150. || rect.height() < 40. {
             return;
         }
         let area = Rect::from_min_max(
-            rect.min + Vec2::new(60., 20.),
-            rect.max - Vec2::new(16., 28.),
+            rect.min + Vec2::new(60., if rect.height() < 85. { 14. } else { 20. }),
+            rect.max - Vec2::new(16., if rect.height() < 85. { 20. } else { 28. }),
         );
         let mut bounds = PlotBounds::NOTHING;
         for (i, trace) in &self.traces {
@@ -1493,17 +1493,19 @@ mod tests {
         assert_eq!(display.configuration()["node"], "v(out) i(v1)");
         let selected = display.selected.clone();
         let ctx = egui::Context::default();
-        let mut output = None;
         for _ in 0..50 {
-            output = Some(ctx.run(egui::RawInput::default(), |ctx| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| display.paint_embedded(ui, Rect::from_min_size(Pos2::ZERO, Vec2::new(600., 400.)), &props));
-            }));
+            });
             if display.traces.len() == 2 { break; }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert_eq!(display.selected, selected);
         assert_eq!(display.trace_groups(), vec![vec![1], vec![2]]);
-        let labels: Vec<_> = output.unwrap().shapes.into_iter().filter_map(|shape| match shape.shape {
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| display.paint_embedded(ui, Rect::from_min_size(Pos2::ZERO, Vec2::new(600., 400.)), &props));
+        });
+        let labels: Vec<_> = output.shapes.into_iter().filter_map(|shape| match shape.shape {
             egui::epaint::Shape::Text(text) if text.galley.job.text.contains("v(out)") || text.galley.job.text.contains("i(v1)") => Some(text.pos.y), _ => None,
         }).collect();
         assert_eq!(labels.len(), 2);
