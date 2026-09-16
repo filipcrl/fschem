@@ -83,17 +83,67 @@ def _stop(process):
 
 
 class Simulation:
-    """Native mode uses analyses/parameters in the schematic, without overrides."""
+    """Explicit native or portable experiment; portable methods return self."""
     def __init__(self, circuit: Schematic, *, mode: str, parameters=None,
-                 corners=None, temperature_c=None):
-        if mode != "native":
-            raise ValueError("only explicit mode='native' is currently supported")
-        if parameters is not None or corners is not None or temperature_c is not None:
+                 corners=None, temperature_c=None, local_parameters=None, exclude=()):
+        from ._portable import expressions, number
+        if mode not in {"native", "portable"}:
+            raise ValueError("mode must be 'native' or 'portable'")
+        if mode == "native" and (parameters is not None or corners is not None or
+                                 temperature_c is not None or local_parameters is not None or exclude):
             raise ValueError("native mode does not accept portable parameter/corner/temperature overrides")
         self.circuit = circuit
         self.mode = mode
+        self.parameters = MappingProxyType(expressions(parameters))
+        self.local_parameters = MappingProxyType({k: MappingProxyType(expressions(v))
+                                                  for k, v in (local_parameters or {}).items()})
+        self.exclude = frozenset(exclude)
+        self.corners = corners
+        self.temperature_c = number(27 if temperature_c is None else temperature_c, "temperature_c")
+        if self.temperature_c <= -273.15:
+            raise ValueError("temperature must exceed absolute zero")
+        self._analyses = []
+
+    def with_parameters(self, parameters=None, **overrides):
+        """Return a new experiment; never mutate this experiment or source files."""
+        import copy
+        if self.mode != "portable":
+            raise ValueError("with_parameters requires portable mode")
+        from ._portable import expressions
+        updated = dict(self.parameters)
+        updated.update(expressions(parameters))
+        updated.update(expressions(overrides))
+        result = copy.copy(self)
+        result.parameters = MappingProxyType(updated)
+        result._analyses = copy.deepcopy(self._analyses)
+        return result
+
+    def _analysis(self, kind, name, save, **kwargs):
+        from ._portable import name as validate_name
+        if self.mode != "portable":
+            raise ValueError("Python analyses require portable mode")
+        validate_name(name)
+        if any(a["name"].lower() == name.lower() for a in self._analyses):
+            raise ValueError("duplicate analysis name")
+        if isinstance(save, str):
+            raise ValueError("save must be a sequence of canonical node paths")
+        self._analyses.append(dict(kind=kind, name=name, save=tuple(save), **kwargs))
+        return self
+
+    def op(self, *, name="op", save=()):
+        return self._analysis("op", name, save)
+
+    def tran(self, *, stop, output_step, max_step=None, name="tran", save=()):
+        from ._portable import number
+        stop = number(stop, "stop", positive=True)
+        output_step = number(output_step, "output_step", positive=True)
+        max_step = number(output_step if max_step is None else max_step, "max_step", positive=True)
+        return self._analysis("tran", name, save, stop=stop, output_step=output_step, max_step=max_step)
 
     def prepare(self, *, backend: Backend):
+        if self.mode == "portable":
+            from ._portable import prepare
+            return prepare(self, backend)
         original = self.circuit.netlist(backend=backend)
         files = {}
         minimum = 1
@@ -124,6 +174,8 @@ class PreparedRun:
     deck_path: str
     files: Mapping[str, str]
     minimum_plots: int
+    mode: str = "native"
+    portable_metadata: Mapping | None = None
 
     @property
     def deck(self):
@@ -146,7 +198,7 @@ class PreparedRun:
                 path.write_text(text)
             data = {
                 "schema_version": SCHEMA_VERSION, "status": "prepared",
-                "backend": self.backend, "mode": "native", "source": str(self.source),
+                "backend": self.backend, "mode": self.mode, "source": str(self.source),
                 "created_at": _now(), "started_at": None, "finished_at": None,
                 "parameters": None, "analyses": {"origin": "native_deck", "minimum_plots": self.minimum_plots},
                 "options": {}, "execution": None,
@@ -156,6 +208,10 @@ class PreparedRun:
                 "input_sha256": {name: _digest(directory / name) for name in self.files},
                 "results": [], "diagnostics": [],
             }
+            if self.portable_metadata is not None:
+                data["portable"] = self.portable_metadata
+                data["parameters"] = dict(self.portable_metadata["parameters"])
+                data["analyses"].update(origin="portable", specifications=self.portable_metadata["analyses"])
             _atomic(directory, data)
         finally:
             claim.unlink()
@@ -182,7 +238,7 @@ class Run:
             raise ValueError("unsupported run manifest schema_version")
         if data.get("status") not in _TERMINAL | {"prepared", "running"}:
             raise ValueError("invalid run status")
-        if data.get("backend") not in {"ngspice", "vacask"} or data.get("mode") != "native":
+        if data.get("backend") not in {"ngspice", "vacask"} or data.get("mode") not in {"native", "portable"}:
             raise ValueError("invalid run backend/mode")
         for key in ("deck", "original_deck", "source_snapshot", "log"):
             _artifact(directory, data["artifacts"][key])

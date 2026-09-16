@@ -26,7 +26,8 @@ class Project:
 
     def __init__(self, root: PathInput = ".", *,
                  library_paths: Iterable[PathInput] = (),
-                 discover_libraries: bool = True):
+                 discover_libraries: bool = True, technology=None):
+        self.technology = technology
         self.root = Path(root).resolve()
         self.library_paths = tuple(self._resolve(p) for p in library_paths)
         self.discover_libraries = discover_libraries

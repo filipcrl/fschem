@@ -93,8 +93,8 @@ def test_overrides_rejected():
     for kwargs in ({"parameters": {}}, {"corners": []}, {"temperature_c": 27}):
         with pytest.raises(ValueError, match="native mode"):
             fschem.Simulation(circuit, mode="native", **kwargs)
-    with pytest.raises(ValueError, match="explicit"):
-        fschem.Simulation(circuit, mode="portable")
+    with pytest.raises(ValueError, match="mode must"):
+        fschem.Simulation(circuit, mode="implicit")
 
 
 def test_concurrent_fresh_runs_and_destination_race(tmp_path):
