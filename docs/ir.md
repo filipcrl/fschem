@@ -18,7 +18,7 @@ model identities/bindings are present, external PDK model bodies and Python anal
 commands are not part of this circuit IR. Actual `prepare` additionally validates
 technology dependencies and experiment capabilities.
 
-## Rust seam for the integration lane's CLI
+## CLI and Rust API
 
 ```rust
 fschem::netlist::dump_ir(
@@ -39,16 +39,21 @@ records **before** serialization; `compile(...)` serializes those exact records.
 Both native exporters and the resolved inspector reuse `resolve_sheet` connectivity;
 inspection does not parse generated decks.
 
-**CLI dispatch is intentionally assigned to integration, not implemented in this
-core lane.** Wire the above seam before GUI initialization in `main.rs`. Intended
-interface: `fschem --dump-ir parsed|resolved|lowered FILE.sch`, existing backend and
-library-path selection, optional `--ir-config FILE.json`, optional explicit output
-path. Print JSON only to stdout; errors to stderr with nonzero exit. Reject mutually
-exclusive actions/unknown stages/options. Do not call `netlist::write_spice` to write
-IR (it is a deck-oriented helper); refuse source/symbol replacement for output.
-Add help and CLI regression tests including no GUI/execution, stdout parsing,
-malformed config and file output. Core/Python tests already cover the serialization
-seam; this is not a claim that CLI flags already exist.
+CLI dispatch runs before GUI initialization:
+
+```sh
+fschem --dump-ir parsed examples/portable.sch
+fschem --dump-ir resolved examples/portable.sch
+fschem --dump-ir lowered --simulator vacask --ir-config examples/portable-ir.json examples/portable.sch
+fschem --dump-ir lowered --output /tmp/fresh-circuit-ir.json --ir-config examples/portable-ir.json examples/portable.sch
+```
+
+`--simulator ngspice|vacask` selects the inspection backend (default ngspice);
+`-L DIR` adds library roots. JSON alone goes to stdout unless `--output` names a
+**fresh** file: existing files/symlinks are refused, preventing accidental source,
+symbol or config replacement. Diagnostics go to stderr with nonzero exit. Other
+actions (`--check`, netlist, simulation, text/run opening and GUI automation) conflict
+with inspection. `--ir-config` and `--output` require `--dump-ir`.
 
 Example lowered configuration (`examples/portable-ir.json`):
 

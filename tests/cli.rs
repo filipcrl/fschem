@@ -263,3 +263,40 @@ fn ir_is_json_only_and_rejects_conflicts_and_source_overwrite() {
     success(&dir.run(&["--dump-ir", "parsed", "--output", "ir.json", "spice.sch"]));
     serde_json::from_slice::<serde_json::Value>(&fs::read(dir.0.join("ir.json")).unwrap()).unwrap();
 }
+
+#[test]
+fn lowered_ir_config_and_backend_selection() {
+    let dir = Workspace::new();
+    fs::write(dir.0.join("portable.sch"), include_str!("../examples/portable.sch")).unwrap();
+    fs::write(dir.0.join("config.json"), include_str!("../examples/portable-ir.json")).unwrap();
+    let output = dir.run(&["--dump-ir", "lowered", "--simulator", "vacask", "--ir-config", "config.json", "portable.sch"]);
+    success(&output);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["backend"], "vacask");
+    for config in ["{broken", r#"{"unknown":1}"#] {
+        fs::write(dir.0.join("config.json"), config).unwrap();
+        let output = dir.run(&["--dump-ir", "lowered", "--ir-config", "config.json", "portable.sch"]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    fs::write(dir.0.join("existing.json"), "keep").unwrap();
+    assert!(!dir.run(&["--dump-ir", "parsed", "--output", "existing.json", "portable.sch"]).status.success());
+    assert_eq!(fs::read_to_string(dir.0.join("existing.json")).unwrap(), "keep");
+}
+
+#[test]
+fn invalid_run_manifests_fail_before_gui_startup() {
+    let dir = Workspace::new();
+    fs::write(dir.0.join("run.json"), "{broken").unwrap();
+    for args in [
+        vec!["--open-run", "run.json"],
+        vec!["--open-run", "."],
+        vec!["--open-run", "run.json", "--check", "spice.sch"],
+        vec!["--open-run", "run.json", "--dump-ir", "parsed", "spice.sch"],
+    ] {
+        let output = dir.run(&args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
+}

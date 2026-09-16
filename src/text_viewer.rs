@@ -167,10 +167,9 @@ impl TextDocument {
             }
             ui.checkbox(&mut self.follow, "Follow");
             ui.checkbox(&mut self.wrap, "Wrap");
-            if ui.button("Copy loaded text").clicked() {
-                if let Some(s) = &self.snapshot {
-                    ui.ctx().copy_text(s.text.clone());
-                }
+            if ui.button("Copy loaded text").clicked()
+                && let Some(s) = &self.snapshot {
+                ui.ctx().copy_text(s.text.clone());
             }
             if self.pending.is_some() {
                 ui.spinner();

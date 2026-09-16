@@ -144,7 +144,10 @@ fn run() -> Result<(), String> {
         if let Some(output) = ir_output {
             protect_source(&input, &output)?;
             if let Some(config) = ir_config { protect_source(&std::fs::canonicalize(config).map_err(|e| e.to_string())?, &output)?; }
-            std::fs::write(output, format!("{json}\n")).map_err(|e| e.to_string())?;
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&output)
+                .map_err(|e| format!("{} (IR output must be a fresh file): {e}", output.display()))?;
+            writeln!(file, "{json}").map_err(|e| e.to_string())?;
         } else { println!("{json}"); }
         return Ok(());
     }

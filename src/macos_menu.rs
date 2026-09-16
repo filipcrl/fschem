@@ -252,6 +252,7 @@ impl NativeMenu {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Independent menu enablement states mirror viewer capabilities.
     pub fn sync(
         &self,
         document: bool,

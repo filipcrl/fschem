@@ -530,3 +530,14 @@ without an OS window.
 
 Extend property editing and connectivity-aware tools on top of the command
 history, and continue using existing Xschem projects as compatibility fixtures.
+
+
+## Python experiments and artifact inspection
+
+The installable headless Python package supports native ngspice/VACASK runs and a
+strict portable op/tran subset, immutable prepared artifacts, NumPy results,
+explicit parameter scopes and narrow IHP LV wrapper binding. See
+[installation/API](docs/python.md), [portable migration and ADC workflow](docs/portable.md),
+and [compiler IR inspection](docs/ir.md). The GUI remains separately installed:
+`fschem --open-run DIRECTORY` inspects run artifacts without executing code;
+`fschem --open-text FILE.py` opens read-only source. Python imports never start a GUI.

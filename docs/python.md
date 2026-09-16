@@ -1,4 +1,4 @@
-# Headless Python API (native stages 1–2)
+# Python experiments and headless API
 
 The installable `fschem` package uses the private PyO3 extension `fschem._core`.
 It links the existing Rust library with `default-features = false`: importing it
@@ -7,16 +7,15 @@ Python >=3.10, Rust >=1.90 and NumPy are required to build from this checkout.
 
 ```sh
 python3 -m venv /tmp/fschem-python-venv
-/tmp/fschem-python-venv/bin/python -m pip install 'maturin>=1.9,<2' pytest numpy
+/tmp/fschem-python-venv/bin/python -m pip install 'maturin>=1.9,<2' pytest jsonschema
 /tmp/fschem-python-venv/bin/maturin build --interpreter /tmp/fschem-python-venv/bin/python --out /tmp/fschem-python-wheels
-/tmp/fschem-python-venv/bin/python -m pip install --force-reinstall --no-deps /tmp/fschem-python-wheels/*.whl
+/tmp/fschem-python-venv/bin/python -m pip install --force-reinstall /tmp/fschem-python-wheels/*.whl
 /tmp/fschem-python-venv/bin/python -m pytest -q
 cargo test --no-default-features
 ```
 
 Alternatively `python -m pip install .` builds/installs the package. The nested
-binding crate intentionally has its own lockfile; the root crate and legacy CLI
-are unchanged. Neither virtualenvs nor build outputs belong in commits.
+binding crate intentionally has its own lockfile; the legacy native exporters and CLI remain available. Neither virtualenvs nor build outputs belong in commits.
 
 ## Load, inspect and generate native decks
 
@@ -32,7 +31,7 @@ for diagnostic in circuit.check(backend="ngspice"):
 deck = circuit.netlist(backend="ngspice")  # returns text, writes nothing
 ```
 
-`Project(root=".", *, library_paths=(), discover_libraries=True)` resolves paths
+`Project(root=".", *, library_paths=(), discover_libraries=True, technology=None)` resolves paths
 against an absolute root captured at construction; it never changes cwd or the
 process environment. Library discovery defaults to the legacy Rust discovery
 (environment/system Xschem paths). Set it false for explicit-only library roots.
@@ -51,8 +50,8 @@ not a guarantee of simulator compatibility.
 `Schematic.netlist(*, backend="ngspice")` supports exactly `ngspice` (legacy
 SPICE exporter) and `vacask` (native VACASK exporter). Native backend-specific
 commands and analyses are retained, not translated. Unsupported export syntax
-fails using the existing Rust exporter. Portable experiment semantics, parameter
-overrides and technology binding are not implemented. Export alone does not stage
+fails using the existing Rust exporter. This native export method does not apply portable experiment semantics, parameter
+overrides or technology binding; use `Simulation(..., mode="portable")` for those. Export alone does not stage
 include/model files; use native preparation/execution below for relocated runs.
 
 Load, export and raw-reader failures currently raise `ValueError` with Rust
@@ -184,8 +183,9 @@ outputs such as `op1.raw`, `tran1.raw` and `ac1.raw` remain separate files.
 `run.result(name)` accepts an exact ID, a unique output basename (`op1`), or a
 unique native plot name (`Operating Point`); ambiguity raises `KeyError`.
 `Result.name` always retains the native plot name, not the output basename.
-Signals and the manifest's `signal_map` use an identity mapping, intentionally
-collision-safe: `v(top:out)` and `v(top.out)` stay distinct. No aliases/case folding.
+Native signals and the manifest's `signal_map` use an identity mapping, intentionally
+collision-safe: `v(top:out)` and `v(top.out)` stay distinct. No native aliases/case folding. Portable runs additionally publish validated canonical
+node aliases (for example `/OUT`); original native keys remain unchanged.
 
 `Run.open(directory)` accepts prepared, running and terminal manifests. It does
 not resume an interrupted process or convert `running` into success. A successful
@@ -207,11 +207,11 @@ All timestamps are ISO-8601 UTC strings; unset values are JSON null.
 |---|---|
 | `schema_version` | integer `1` |
 | `status` | `prepared`, `running`, `succeeded`, `failed`, `cancelled`, `timed_out` |
-| `backend`, `mode` | `ngspice` or `vacask`; `native` |
+| `backend`, `mode` | `ngspice` or `vacask`; `native` or `portable` |
 | `source` | absolute original schematic path |
 | `created_at`, `started_at`, `finished_at` | timestamp; latter two nullable |
-| `parameters` | null: no portable overrides applied |
-| `analyses` | `{ "origin": "native_deck", "minimum_plots": positive_integer }` |
+| `parameters` | native: null; portable: root expression definitions |
+| `analyses` | native: `{ "origin": "native_deck", "minimum_plots": positive_integer }`; portable additionally retains named `specifications` with `origin="portable"` |
 | `options` | initially `{}`; execution sets `{ "timeout_seconds": number_or_null }` |
 | `execution` | null before launch; object described below |
 | `artifacts` | `{ "deck": path, "original_deck": "original.deck", "source_snapshot": "source.sch", "log": "simulator.log", "inputs": [path, ...] }` |
@@ -221,7 +221,7 @@ All timestamps are ISO-8601 UTC strings; unset values are JSON null.
 
 All artifact paths are relative to the manifest directory and must resolve inside
 it (including symlink resolution); source and execution cwd are absolute. `deck`
-is `circuit.spice` or `circuit.sim`. `original.deck` is the unmodified Rust export;
+is `circuit.spice` or `circuit.sim`. `original.deck` is the unmodified Rust native export (or generated portable deck);
 `source.sch` is the loaded top-level source snapshot. `inputs` lists every staged
 file, including the deck, source, original export and optional startup/config.
 The log can be absent before launch. Failed raw files may exist but are **not**
@@ -271,5 +271,54 @@ Explicit `mode="portable"` is now available alongside the native runner describe
 above. See [portable.md](portable.md) for supported devices/waveforms, IHP technology
 configuration, parameter scopes, exact native-block migration, op/tran and saves.
 `Schematic.dump_ir` and `Simulation.dump_ir` expose deterministic versioned circuit
-snapshots; [ir.md](ir.md) specifies their schemas and the integration CLI seam.
+snapshots; [ir.md](ir.md) specifies their schemas and the `--dump-ir` CLI.
 Native mode still rejects portable overrides; its compatibility behavior is unchanged.
+
+
+## Open runs in the desktop viewer
+
+Build/install the GUI separately (not bundled in the Python wheel):
+
+```sh
+cargo install --path . --locked
+fschem --open-run /tmp/my-run
+# A direct manifest filename is also accepted:
+fschem --open-run /tmp/my-run/run.json
+fschem --open-text examples/python_portable.py
+```
+
+```python
+import fschem
+process = fschem.viewer.open_run("/tmp/my-run", executable="fschem")
+# Returns subprocess.Popen; launch uses an argument list, never a shell.
+```
+
+The GUI validates v1, statuses, result IDs/mappings and contained relative paths
+(including symlinks); missing/partial files stay visible but unavailable. It offers
+original source, generated deck, source snapshot, staged inputs/IR and log navigation,
+and opens each named result at its exact plot index in the detached graph window.
+Native measurement text is available in the log. An optional additive
+`artifacts.measurements` relative text/JSON filename is supported, but the runner
+currently does **not** emit a standardized measurements file/API.
+Reload the manifest explicitly to see updates. Text logs have their own follow mode.
+Ordinary raw opening and schematic graphs discover valid sibling `run.json` signal
+maps, display canonical aliases **alongside** native names, and accept canonical
+schematic graph node selections. No colon/dot guessing is performed. A custom-named
+manifest is navigable, but automatic raw aliases require the standard `run.json` name.
+
+The GUI is an inspector, not the Python integrity/reopening API: it bounds manifests
+at 4 MiB and validates graph aliases against parsed plot names and signal lists;
+it does not verify recorded SHA-256 hashes. Use `Run.open` for hash-verified results.
+Files on disk can change after inspection; neither viewer is a malicious-filesystem
+sandbox. Opening manifests, scripts or sources never runs code. Original schematic
+source navigation opens the existing editor; artifact text is read-only.
+
+The optional configured Python script launcher is **deferred**. Run scripts explicitly
+from your terminal with your chosen interpreter. No embedded interpreter, automatic
+execution on `.py` open, or unsaved-source execution path has been introduced.
+
+Runnable workflows (use fresh output directories and an explicit clean HOME when
+host startup configuration needs isolation): `examples/python_native.py`,
+`examples/python_run.py`, `examples/python_portable.py`, and
+`examples/python_portable_ihp.py --help`. The latter reads external IHP/ADC inputs;
+see [portable.md](portable.md) for exact migration and ADC preparation limitations.

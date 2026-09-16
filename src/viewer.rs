@@ -643,10 +643,9 @@ impl DocumentView {
             (a.size().x * a.size().y).total_cmp(&(b.size().x * b.size().y))
         });
         if additive {
-            if let Some((id, _)) = hits.first() {
-                if !self.selected.remove(id) {
-                    self.selected.insert(*id);
-                }
+            if let Some((id, _)) = hits.first()
+                && !self.selected.remove(id) {
+                self.selected.insert(*id);
             }
             return;
         }
@@ -1434,12 +1433,10 @@ impl Viewer {
                     .is_some_and(|e| e.eq_ignore_ascii_case("raw"))
                 {
                     self.waveforms.load(ctx, path);
+                } else if crate::text_viewer::is_text(&path) {
+                    self.action(ctx, Action::OpenText(path));
                 } else {
-                    if crate::text_viewer::is_text(&path) {
-                        self.action(ctx, Action::OpenText(path));
-                    } else {
-                        self.open_tab(ctx, Some(path));
-                    }
+                    self.open_tab(ctx, Some(path));
                 }
             }
             Action::CloseTab => self.close_tab(self.active_tab),
@@ -2451,9 +2448,8 @@ impl Viewer {
             .default_size([800., 550.])
             .show(ctx, |ui| {
                 if let Some(current) = &self.current {
-                    if let Some(path) = &current.loaded.path {
-                        if ui.button("Open disk source in text tab").clicked() { actions.push(Action::OpenText(path.clone())); }
-                    }
+                    if let Some(path) = &current.loaded.path
+                        && ui.button("Open disk source in text tab").clicked() { actions.push(Action::OpenText(path.clone())); }
                     let text = preview(current.loaded.document.original(), 100_000);
                     let mut text = text.as_str();
                     egui::ScrollArea::both().show(ui, |ui| {
