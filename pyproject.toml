@@ -7,7 +7,7 @@ name = "fschem"
 version = "0.1.0"
 description = "Headless Xschem loading, native netlisting and NumPy raw results"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.23"]
+dependencies = ["numpy>=1.23", "tomli>=2; python_version < '3.11'", "tomli-w>=1"]
 license = "MIT AND GPL-2.0-or-later"
 
 [project.optional-dependencies]
