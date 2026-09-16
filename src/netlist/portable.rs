@@ -229,10 +229,11 @@ pub fn elaborate(
         &BTreeSet::new(),
         0,
     )?;
-    for key in compiler
+    if let Some(key) = compiler
         .options
         .exclude
         .difference(&compiler.used_exclusions)
+        .next()
     {
         return Err(format!("exclusion matched no native block: {key}"));
     }
@@ -371,12 +372,12 @@ impl Compiler {
                 root_name(key)?;
                 for node in nodes {
                     let node = root_name(node)?;
-                    if !node_map.contains_key(&node.to_ascii_lowercase()) {
-                        node_map.insert(node.to_ascii_lowercase(), node.into());
-                    }
+                    node_map
+                        .entry(node.to_ascii_lowercase())
+                        .or_insert_with(|| node.into());
                 }
             }
-            for (_, (_, nodes, _)) in &self.options.sources {
+            for (_, nodes, _) in self.options.sources.values() {
                 for node in nodes {
                     self.signals.insert(
                         node.clone(),
@@ -433,6 +434,14 @@ impl Compiler {
                 };
                 self.signals.insert(format!("{path}/{net}"), node.clone());
                 nodes.push(node);
+            }
+            for properties in [&c.info.properties, &c.defaults] {
+                let mut keys = BTreeSet::new();
+                for (key, _) in &properties.entries {
+                    if !keys.insert(key) {
+                        return Err(format!("{instance}: ambiguous duplicate property {key}"));
+                    }
+                }
             }
             let mut allowed: BTreeSet<&str> = [
                 "name",

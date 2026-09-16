@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fschem.local/schemas/compiler-ir-v1.schema.json",
+  "title": "fschem read-only compiler snapshot v1",
+  "type": "object",
+  "required": ["schema_version", "stage", "source"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "stage": {"enum": ["parsed", "resolved", "lowered"]},
+    "source": {"type": "string"}
+  },
+  "allOf": [
+    {"if": {"properties": {"stage": {"const": "parsed"}}}, "then": {
+      "required": ["text", "records"], "properties": {
+        "text": {"type": "string"}, "records": {"type": "array", "items": {"$ref": "#/$defs/record"}}
+      }
+    }},
+    {"if": {"properties": {"stage": {"const": "resolved"}}}, "then": {
+      "required": ["sheets", "instances", "ignore_policy"], "properties": {
+        "sheets": {"type": "array", "items": {"type": "object", "required": ["id", "source", "ports", "nets", "native_preambles"]}},
+        "instances": {"type": "array", "items": {"type": "object", "required": ["id", "source", "line", "symbol", "kind", "pins", "properties", "symbol_defaults", "symbol_metadata"], "properties": {
+          "pins": {"type": "array", "items": {"type": "object", "required": ["order", "name", "net", "properties"]}}
+        }}}
+      }
+    }},
+    {"if": {"properties": {"stage": {"const": "lowered"}}}, "then": {
+      "required": ["backend", "devices", "scopes", "signal_map", "requires_ihp_lv_wrappers", "hierarchy_policy"], "properties": {
+        "backend": {"enum": ["ngspice", "vacask"]},
+        "devices": {"type": "array", "items": {"$ref": "#/$defs/device"}},
+        "scopes": {"type": "array", "items": {"type": "object", "required": ["id", "source", "effective_parameters", "interface_parameters", "local_definitions", "experiment_definitions"], "properties": {"effective_parameters": {"type": "object", "additionalProperties": {"type": "number"}}}}},
+        "signal_map": {"type": "object", "additionalProperties": {"type": "string"}},
+        "requires_ihp_lv_wrappers": {"type": "boolean"}
+      }
+    }}
+  ],
+  "$defs": {
+    "record": {
+      "type": "object", "required": ["id", "line", "span", "raw", "kind"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^record:[0-9]+$"},
+        "line": {"type": "integer", "minimum": 1},
+        "span": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "integer", "minimum": 0}},
+        "raw": {"type": "string"}, "kind": {"type": "string"},
+        "records": {"type": "array", "items": {"$ref": "#/$defs/record"}}
+      }
+    },
+    "device": {
+      "type": "object",
+      "required": ["id", "source", "line", "symbol", "kind", "model", "emitted_name", "terminals", "expressions", "parameters", "waveform", "behavior"],
+      "properties": {
+        "id": {"type": "string"}, "source": {"type": "string"}, "line": {"type": ["integer", "null"]},
+        "symbol": {"type": ["string", "null"]}, "kind": {"type": "string"}, "model": {"type": "string"}, "emitted_name": {"type": "string"},
+        "terminals": {"type": "array", "items": {"type": "object", "required": ["name", "node"], "properties": {"name": {"type": "string"}, "node": {"type": "string"}}}},
+        "expressions": {"type": "object", "additionalProperties": {"type": "string"}},
+        "parameters": {"type": "object", "additionalProperties": {"type": "number"}},
+        "waveform": {"type": ["object", "null"]}, "behavior": {"type": ["object", "null"]}
+      }
+    }
+  }
+}

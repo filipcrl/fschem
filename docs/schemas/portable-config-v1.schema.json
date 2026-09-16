@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fschem.local/schemas/portable-config-v1.schema.json",
+  "title": "fschem lowered IR configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "parameters": {"$ref": "#/$defs/parameters"},
+    "local_parameters": {"type": "object", "additionalProperties": {"$ref": "#/$defs/parameters"}},
+    "exclude": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "sources": {"type": "object", "additionalProperties": {"$ref": "#/$defs/source"}}
+  },
+  "$defs": {
+    "expression": {"type": ["string", "number"]},
+    "parameters": {"type": "object", "additionalProperties": {"$ref": "#/$defs/expression"}},
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "nodes", "value"],
+      "properties": {
+        "kind": {"enum": ["voltage", "current"]},
+        "nodes": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "string", "pattern": "^/[A-Za-z0-9_]+$"}},
+        "value": {"$ref": "#/$defs/expression"}
+      }
+    }
+  }
+}

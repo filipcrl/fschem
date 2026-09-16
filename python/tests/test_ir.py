@@ -87,3 +87,15 @@ def test_incomplete_parsed_stage_fails(tmp_path):
     c = fschem.Project(tmp_path, discover_libraries=False).load('bad.sch')
     with pytest.raises(ValueError, match='parsed IR unavailable'):
         c.dump_ir('parsed')
+
+
+def test_machine_readable_schemas(circuit):
+    import jsonschema
+    config = json.loads((ROOT / 'examples/portable-ir.json').read_text())
+    config_schema = json.loads((ROOT / 'docs/schemas/portable-config-v1.schema.json').read_text())
+    snapshot_schema = json.loads((ROOT / 'docs/schemas/compiler-ir-v1.schema.json').read_text())
+    for schema in [config_schema, snapshot_schema]:
+        jsonschema.Draft202012Validator.check_schema(schema)
+    jsonschema.validate(config, config_schema)
+    for stage in ['parsed', 'resolved', 'lowered']:
+        jsonschema.validate(circuit.dump_ir(stage, config=config if stage == 'lowered' else {}), snapshot_schema)

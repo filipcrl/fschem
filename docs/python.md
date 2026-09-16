@@ -111,10 +111,10 @@ result = reopened.result("Operating Point")
 print(result.voltage("vout"))
 ```
 
-`Simulation(circuit, *, mode, parameters=None, corners=None, temperature_c=None)`
-requires `mode="native"`. Any non-None portable override (even an empty mapping)
-is rejected, never ignored. Analyses and parameters come from the native deck.
-There are no `tran`, `with_parameters`, portable lowering or technology APIs yet.
+For the native runner, select `Simulation(circuit, mode="native")`. Any non-None
+portable override (even an empty mapping) is rejected, never ignored. Analyses and
+parameters come from the native deck. The explicit `mode="portable"` alternative
+and its additional APIs are documented in [portable.md](portable.md).
 
 `prepare(*, backend)` returns a frozen `PreparedRun` containing the executed deck
 and staged text files. `write(directory)` returns a `Run` with status `prepared`.
@@ -264,3 +264,12 @@ extension; `plot_index` is zero-based within that file. Order is filename order,
 then native plot order. Viewer navigation should use `id`, display both names,
 and open `path` without inferring filename or signal aliases. This schema is an
 artifact contract, not permission to execute anything in a manifest.
+
+## Portable compilation and stage inspection
+
+Explicit `mode="portable"` is now available alongside the native runner described
+above. See [portable.md](portable.md) for supported devices/waveforms, IHP technology
+configuration, parameter scopes, exact native-block migration, op/tran and saves.
+`Schematic.dump_ir` and `Simulation.dump_ir` expose deterministic versioned circuit
+snapshots; [ir.md](ir.md) specifies their schemas and the integration CLI seam.
+Native mode still rejects portable overrides; its compatibility behavior is unchanged.

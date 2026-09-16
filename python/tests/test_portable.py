@@ -199,3 +199,41 @@ def test_per_analysis_saves(tmp_path, backend):
     assert run.result('output').voltage('/VOUT')[0] == pytest.approx(2)
     assert run.result('input').voltage('/VIN')[0] == pytest.approx(3)
     assert '/VIN' not in run.result('output').signal_map
+
+
+def test_expression_bounds_and_duplicate_properties(tmp_path):
+    symbol(tmp_path, 'r', 'resistor', ['P', 'N'], 'name=R value=1 m=1')
+    c = circuit(tmp_path, [('r', 'name=R value=1 value=2', ['OUT', '0'])])
+    with pytest.raises(ValueError, match='duplicate property'):
+        compile_raw(c)
+    c = circuit(tmp_path, [('r', 'name=R value={x}', ['OUT', '0'])])
+    with pytest.raises(ValueError, match='nesting'):
+        compile_raw(c, parameters={'x': '(' * 200 + '1' + ')' * 200})
+    with pytest.raises(ValueError, match='16 KiB'):
+        compile_raw(c, parameters={'x': 'a' * 20000})
+
+    with pytest.raises(ValueError, match='512 subexpressions'):
+        compile_raw(c, parameters={'x': '+'.join(['1'] * 600)})
+
+
+@pytest.mark.parametrize('backend', ['ngspice', 'vacask'])
+@pytest.mark.parametrize('device', ['vcvs', 'isource'])
+def test_controlled_voltage_and_current_source(tmp_path, backend, device):
+    if not shutil.which(backend):
+        pytest.skip('engine unavailable')
+    symbol(tmp_path, 'r', 'resistor', ['P', 'N'], 'name=R value=1k m=1')
+    if device == 'vcvs':
+        symbol(tmp_path, 'v', 'vsource', ['P', 'N'], 'name=V value=1')
+        symbol(tmp_path, 'e', 'vcvs', ['P', 'N', 'CP', 'CN'], 'name=E value=2')
+        instances = [('v', 'name=V', ['IN', '0']), ('e', 'name=E', ['OUT', '0', 'IN', '0'])]
+        expected = 2
+    else:
+        symbol(tmp_path, 'i', 'isource', ['P', 'N'], 'name=I value=2m')
+        instances = [('i', 'name=I', ['OUT', '0'])]
+        expected = -2
+    instances.append(('r', 'name=R', ['OUT', '0']))
+    c = circuit(tmp_path, instances)
+    (tmp_path / 'home').mkdir()
+    run = fschem.Simulation(c, mode='portable').op().run(
+        backend=backend, directory=tmp_path / 'run', timeout=20, env={'HOME': str(tmp_path / 'home')})
+    assert run.result('op').voltage('/OUT')[0] == pytest.approx(expected)

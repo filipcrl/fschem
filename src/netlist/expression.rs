@@ -11,6 +11,9 @@ pub enum Expr {
 }
 impl Expr {
     pub fn parse(text: &str) -> Result<Self, String> {
+        if text.len() > 16384 {
+            return Err("expression exceeds 16 KiB limit".into());
+        }
         let text = text.trim();
         let text = text
             .strip_prefix("\\{")
@@ -23,6 +26,8 @@ impl Expr {
         let mut parser = Parser {
             text: text.as_bytes(),
             at: 0,
+            depth: 0,
+            expressions: 0,
         };
         let result = parser.expr(0)?;
         parser.space();
@@ -62,6 +67,8 @@ impl Expr {
 struct Parser<'a> {
     text: &'a [u8],
     at: usize,
+    depth: usize,
+    expressions: usize,
 }
 impl Parser<'_> {
     fn space(&mut self) {
@@ -87,6 +94,19 @@ impl Parser<'_> {
             .into())
     }
     fn expr(&mut self, min: u8) -> Result<Expr, String> {
+        self.expressions += 1;
+        if self.expressions > 512 {
+            return Err("expression exceeds 512 subexpressions".into());
+        }
+        if self.depth >= 128 {
+            return Err("expression nesting exceeds 128 levels".into());
+        }
+        self.depth += 1;
+        let result = self.inner_expr(min);
+        self.depth -= 1;
+        result
+    }
+    fn inner_expr(&mut self, min: u8) -> Result<Expr, String> {
         self.space();
         let ch = *self.text.get(self.at).ok_or("expected expression")?;
         let mut lhs = if ch == b'+' || ch == b'-' {

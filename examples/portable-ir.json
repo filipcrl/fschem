@@ -1,0 +1,6 @@
+{
+  "parameters": {"R": "10k", "VDD": 3},
+  "local_parameters": {},
+  "exclude": [],
+  "sources": {}
+}
