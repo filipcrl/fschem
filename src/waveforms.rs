@@ -25,6 +25,11 @@ impl Waveforms {
     pub fn load(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.state.lock().unwrap().load(ctx, path);
     }
+    pub fn load_plot(&mut self, ctx: &egui::Context, path: PathBuf, plot: usize) {
+        let mut state = self.state.lock().unwrap();
+        state.data = None; // Explicit analysis selection must not restore another plot.
+        state.load_selected(ctx, path, Some(plot));
+    }
     pub fn show(&mut self, ctx: &egui::Context) {
         let title = {
             let mut state = self.state.lock().unwrap();
@@ -98,6 +103,9 @@ impl WindowState {
     }
 
     pub fn load(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.load_selected(ctx, path, None);
+    }
+    fn load_selected(&mut self, ctx: &egui::Context, path: PathBuf, plot: Option<usize>) {
         self.watched = Some(path.clone());
         self.stamp = file_stamp(&path);
         self.checked = Some(std::time::Instant::now());
@@ -107,7 +115,11 @@ impl WindowState {
         self.open = true;
         let background_ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = RawFile::open(&path).map(|raw| Display::new(path, raw));
+            let result = RawFile::open(&path).and_then(|raw| {
+                let mut display = Display::new(path, raw);
+                if let Some(index) = plot { display.open_plot(index)?; }
+                Ok(display)
+            });
             let _ = tx.send(result);
             background_ctx.request_repaint_of(viewport_id());
             background_ctx.request_repaint_of(egui::ViewportId::ROOT);

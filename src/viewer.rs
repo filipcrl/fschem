@@ -40,6 +40,7 @@ fn format_grid_spacing(spacing: f64) -> String {
 pub struct Options {
     pub input: Option<PathBuf>,
     pub open_as_text: bool,
+    pub open_run: bool,
     pub libraries: LibraryPaths,
     pub smoke_test: bool,
     pub screenshot: Option<PathBuf>,
@@ -857,6 +858,8 @@ enum Action {
     OpenDialog,
     OpenTextDialog,
     OpenText(PathBuf),
+    OpenRun(PathBuf),
+    OpenRunDialog,
     CloseTab,
     Demo,
     Reload,
@@ -869,6 +872,7 @@ enum Action {
 }
 
 pub struct Viewer {
+    run_view: Option<crate::run_artifact::RunArtifact>,
     #[cfg(target_os = "macos")]
     native_menu: Option<crate::macos_menu::NativeMenu>,
     text: Option<crate::text_viewer::TextDocument>,
@@ -910,6 +914,7 @@ impl Viewer {
         ctx.set_visuals(egui::Visuals::dark());
         let (sender, receiver) = mpsc::channel();
         let mut viewer = Self {
+            run_view: None,
             #[cfg(target_os = "macos")]
             native_menu: None,
             text: None,
@@ -946,7 +951,7 @@ impl Viewer {
             last_file_check: Instant::now(),
         };
         if let Some(path) = options.input {
-            viewer.action(ctx, if options.open_as_text { Action::OpenText(path) } else { Action::Open(path) });
+            viewer.action(ctx, if options.open_run { Action::OpenRun(path) } else if options.open_as_text { Action::OpenText(path) } else { Action::Open(path) });
         } else if viewer.smoke || viewer.screenshot.is_some() {
             viewer.load(ctx, None, false);
         }
@@ -1266,7 +1271,7 @@ impl Viewer {
                 self.text.as_mut().unwrap().reload(ctx);
                 return;
             }
-            if !matches!(action, Action::Open(_) | Action::OpenText(_) | Action::OpenTextDialog | Action::OpenDialog | Action::CloseTab | Action::Demo | Action::OpenRaw) {
+            if !matches!(action, Action::OpenRun(_) | Action::OpenRunDialog | Action::Open(_) | Action::OpenText(_) | Action::OpenTextDialog | Action::OpenDialog | Action::CloseTab | Action::Demo | Action::OpenRaw) {
                 return;
             }
         }
@@ -1394,6 +1399,15 @@ impl Viewer {
                     }
                 }
             }
+            Action::OpenRun(path) => {
+                match crate::run_artifact::RunArtifact::open(&path) {
+                    Ok(run) => { self.run_view = Some(run); self.error = None; }
+                    Err(error) => self.error = Some(error),
+                }
+            }
+            Action::OpenRunDialog => {
+                if let Some(path) = rfd::FileDialog::new().set_title("Open run manifest").add_filter("Run manifest", &["json"]).pick_file() { self.action(ctx, Action::OpenRun(path)); }
+            }
             Action::OpenText(path) => {
                 self.request += 1;
                 self.loading = None;
@@ -1411,6 +1425,10 @@ impl Viewer {
                 }
             }
             Action::Open(path) => {
+                if path.is_dir() || path.file_name().is_some_and(|n| n == "run.json") {
+                    self.action(ctx, Action::OpenRun(path));
+                    return;
+                }
                 if path
                     .extension()
                     .is_some_and(|e| e.eq_ignore_ascii_case("raw"))
@@ -1715,6 +1733,7 @@ impl Viewer {
                         .color(Color32::from_rgb(120, 220, 160)),
                 );
                 ui.menu_button("File", |ui| {
+                    if ui.button("Open run…").clicked() { actions.push(Action::OpenRunDialog); }
                     if ui.button("Open as text…").clicked() { actions.push(Action::OpenTextDialog); ui.close(); }
                     if ui.button("Open…     Ctrl/Command-O").clicked() {
                         actions.push(Action::OpenDialog);
@@ -1884,7 +1903,8 @@ impl Viewer {
         });
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Open as text…").clicked() { actions.push(Action::OpenTextDialog); }
+                if ui.button("Open run…").clicked() { actions.push(Action::OpenRunDialog); }
+                    if ui.button("Open as text…").clicked() { actions.push(Action::OpenTextDialog); }
                 if ui.button("Open…").clicked() {
                     actions.push(Action::OpenDialog);
                 }
@@ -2369,6 +2389,44 @@ impl Viewer {
         self.automation(ctx);
     }
     fn windows(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let mut keep_run = true;
+        if let Some(run) = &self.run_view {
+            egui::Window::new("Run artifacts (read only)").open(&mut keep_run).default_size([650., 500.]).show(ctx, |ui| {
+                ui.label(run.path.display().to_string());
+                ui.heading(format!("{} · {} · {}", run.manifest.status, run.manifest.backend, run.manifest.mode));
+                ui.label("Opening artifacts never executes code. Reload to observe lifecycle changes.");
+                if ui.button("Reload manifest").clicked() { actions.push(Action::OpenRun(run.path.clone())); }
+                egui::ScrollArea::both().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(run.manifest.source.display().to_string());
+                        if ui.add_enabled(run.manifest.source.is_file(), egui::Button::new("Open source")).clicked() { actions.push(Action::Open(run.manifest.source.clone())); }
+                    });
+                    ui.collapsing("Analysis specification", |ui| { ui.monospace(serde_json::to_string_pretty(&run.manifest.analyses).unwrap_or_default()); });
+                    ui.heading("Results");
+                    if run.manifest.results.is_empty() { ui.label("No published results (prepared/partial/failed runs retain text artifacts)."); }
+                    for result in &run.manifest.results {
+                        let path = crate::run_artifact::contained(&run.root, &result.path);
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{} — {} — {}", result.id, result.analysis_name, result.name));
+                            match path {
+                                Ok(path) if path.is_file() => { if ui.button("Graphs").clicked() { self.waveforms.load_plot(ctx, path, result.plot_index); } }
+                                _ => { ui.colored_label(Color32::LIGHT_RED, "Missing or unsafe raw file"); }
+                            }
+                        });
+                    }
+                    ui.heading("Text artifacts / measurements");
+                    for (label, path) in &run.files {
+                        let safe = path.strip_prefix(&run.root).ok().and_then(|p| crate::run_artifact::contained(&run.root, &p.to_string_lossy()).ok()).is_some();
+                        if ui.add_enabled(safe && path.is_file(), egui::Button::new(format!("{label}: {}", path.display()))).clicked() { actions.push(Action::OpenText(path.clone())); }
+                        if !safe || !path.is_file() { ui.label("Missing/unavailable (normal for logs before execution)"); }
+                    }
+                    if !run.files.iter().any(|(label, _)| label == "measurements") { ui.label("No measurement artifact published; native measurements may appear in the log."); }
+                    for diagnostic in &run.manifest.diagnostics { ui.monospace(diagnostic.to_string()); }
+                });
+            });
+        }
+        if !keep_run { self.run_view = None; }
+
         egui::Window::new("Symbol libraries").open(&mut self.show_libraries).default_width(620.).show(ctx, |ui| {
             ui.label("Resolution order: document directory, then these folders. Bare names also check each folder's devices/ subdirectory.");
             let mut remove = None;
@@ -2463,7 +2521,7 @@ impl Viewer {
         if let Some(text) = &self.text {
             if text.failed() && self.smoke { ctx.send_viewport_cmd(egui::ViewportCommand::Close); return; }
             if !text.ready() { return; }
-        } else if self.current.is_none() { return; }
+        } else if self.current.is_none() && self.run_view.is_none() { return; }
         if self.smoke || self.screenshot.is_some() {
             self.ready_frames += 1;
             ctx.request_repaint();
@@ -2776,7 +2834,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
-                open_as_text: false,
+                open_as_text: false, open_run: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -2992,7 +3050,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
-                open_as_text: false,
+                open_as_text: false, open_run: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3151,7 +3209,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
-                open_as_text: false,
+                open_as_text: false, open_run: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3397,7 +3455,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
-                open_as_text: false,
+                open_as_text: false, open_run: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3559,7 +3617,7 @@ mod tests {
     #[test]
     fn text_tabs_isolate_actions_and_preserve_dirty_schematic_hierarchy() {
         let ctx = egui::Context::default();
-        let mut viewer = Viewer::new(&ctx, Options { input: None, open_as_text: false, libraries: LibraryPaths::default(), smoke_test: false, screenshot: None }, Arc::new(AtomicBool::new(false)));
+        let mut viewer = Viewer::new(&ctx, Options { input: None, open_as_text: false, open_run: false, libraries: LibraryPaths::default(), smoke_test: false, screenshot: None }, Arc::new(AtomicBool::new(false)));
         let mut view = selection_view();
         view.selected = BTreeSet::from([Selection::Instance(0)]);
         view.delete_selection(&viewer.paths).unwrap();
@@ -3591,7 +3649,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
-                open_as_text: false,
+                open_as_text: false, open_run: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3691,7 +3749,7 @@ mod tests {
             &ctx,
             Options {
                 input: Some(dir.join("parent.sch")),
-                open_as_text: false,
+                open_as_text: false, open_run: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3776,7 +3834,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
-                open_as_text: false,
+                open_as_text: false, open_run: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,

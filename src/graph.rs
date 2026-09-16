@@ -11,6 +11,26 @@ use std::{
         mpsc,
     },
 };
+fn signal_label(native: &str, aliases: &BTreeMap<String, String>) -> String {
+    let names: Vec<_> = aliases.iter().filter(|(alias, target)| alias.starts_with('/') && target.as_str() == native).map(|(alias, _)| alias.as_str()).collect();
+    if names.is_empty() { native.into() } else { format!("{} ({native})", names.join(", ")) }
+}
+fn artifact_aliases(path: &std::path::Path, raw: &RawFile) -> Vec<BTreeMap<String, String>> {
+    let mut aliases = vec![BTreeMap::new(); raw.plots.len()];
+    let Some(parent) = path.parent() else { return aliases; };
+    if let Ok(run) = crate::run_artifact::RunArtifact::open(&parent.join("run.json")) {
+        for result in &run.manifest.results {
+            let matches_path = crate::run_artifact::contained(&run.root, &result.path).ok().and_then(|p| p.canonicalize().ok()) == path.canonicalize().ok();
+            if matches_path && let Some(plot) = raw.plots.get(result.plot_index) {
+                // Stale or mismatched manifests must not relabel another dataset.
+                if plot.name == result.name && result.signals == plot.variables.iter().map(|v| v.name.clone()).collect::<Vec<_>>() {
+                    aliases[result.plot_index] = result.signal_map.clone();
+                }
+            }
+        }
+    }
+    aliases
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Real,
@@ -66,7 +86,7 @@ impl Drop for Preparation {
     }
 }
 impl Trace {
-    fn new(plot: &RawPlot, index: usize, mode: Mode, log_x: bool) -> Self {
+    fn new(plot: &RawPlot, index: usize, mode: Mode, log_x: bool, aliases: &BTreeMap<String, String>) -> Self {
         let (segments, omitted) = trace_points(plot, index, mode, log_x);
         let variable = &plot.variables[index];
         let units = match mode {
@@ -76,7 +96,7 @@ impl Trace {
         };
         Self {
             index,
-            label: format!("{} [{units}]", variable.name),
+            label: format!("{} [{units}]", signal_label(&variable.name, aliases)),
             series: Series::new(segments),
             omitted,
             overview_view: None,
@@ -95,6 +115,7 @@ enum GroupMode {
 pub(crate) struct Display {
     pub(crate) path: PathBuf,
     raw: Arc<RawFile>,
+    aliases: Arc<Vec<BTreeMap<String, String>>>,
     plot: usize,
     selected: Vec<bool>,
     filter: String,
@@ -114,7 +135,9 @@ pub(crate) struct Display {
 }
 impl Display {
     pub(crate) fn new(path: PathBuf, raw: RawFile) -> Self {
+        let aliases = artifact_aliases(&path, &raw);
         let mut result = Self {
+            aliases: Arc::new(aliases),
             path,
             raw: Arc::new(raw),
             plot: 0,
@@ -142,12 +165,20 @@ impl Display {
             if *selected {
                 result.traces.insert(
                     i,
-                    Trace::new(&result.raw.plots[result.plot], i, result.mode, result.log_x),
+                    Trace::new(&result.raw.plots[result.plot], i, result.mode, result.log_x, &result.aliases[result.plot]),
                 );
             }
         }
         result.dirty = false;
         result
+    }
+    pub(crate) fn open_plot(&mut self, index: usize) -> Result<(), String> {
+        if index >= self.raw.plots.len() { return Err("Published plot is missing from raw file".into()); }
+        self.plot = index;
+        self.select_plot();
+        self.traces.clear();
+        self.dirty = true;
+        Ok(())
     }
     /// Keep signal selection and navigation when the underlying file is replaced.
     pub(crate) fn restore_view(&mut self, previous: &Self) {
@@ -198,7 +229,8 @@ impl Display {
                 .map(|(i, v)| {
                     Some(i) != plot.scale()
                         && names.iter().any(|n| {
-                            v.name.eq_ignore_ascii_case(n)
+                            self.aliases[self.plot].get(*n).is_some_and(|native| native == &v.name)
+                                || v.name.eq_ignore_ascii_case(n)
                                 || v.name.eq_ignore_ascii_case(&format!("v({n})"))
                         })
                 })
@@ -405,7 +437,7 @@ impl Display {
                             .iter()
                             .enumerate()
                             .filter(|(i, v)| {
-                                Some(*i) != scale && v.name.to_ascii_lowercase().contains(&filter)
+                                Some(*i) != scale && signal_label(&v.name, &self.aliases[self.plot]).to_ascii_lowercase().contains(&filter)
                             })
                             .map(|(i, _)| i)
                             .collect();
@@ -419,7 +451,7 @@ impl Display {
                             for row in rows {
                                 let index = self.filtered[row];
                                 let variable = &plot.variables[index];
-                                let label = format!("{} [{}]", variable.name, unit(&variable.kind));
+                                let label = format!("{} [{}]", signal_label(&variable.name, &self.aliases[self.plot]), unit(&variable.kind));
                                 if ui.checkbox(&mut self.selected[index], label).changed() {
                                     self.dirty = true;
                                     self.fit = true;
@@ -855,6 +887,7 @@ impl Display {
             return;
         }
         let raw = Arc::clone(&self.raw);
+        let aliases = Arc::clone(&self.aliases);
         let (tx, rx) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         self.preparing = Some(Preparation {
@@ -869,7 +902,7 @@ impl Display {
                 if cancelled.load(Ordering::Relaxed) {
                     return;
                 }
-                traces.push(Trace::new(&raw.plots[plot], i, mode, log_x));
+                traces.push(Trace::new(&raw.plots[plot], i, mode, log_x, &aliases[plot]));
             }
             if cancelled.load(Ordering::Relaxed) {
                 return;
@@ -1356,6 +1389,19 @@ fn trace_color(index: usize) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn canonical_aliases_preserve_native_names_and_configure_graphs() {
+        let raw = RawFile::parse(b"Title: test\nPlotname: Operating Point\nFlags: real\nNo. Variables: 2\nNo. Points: 1\nVariables:\n0 v(top:out) voltage\n1 v(top.out) voltage\nValues:\n0 2\n3\n").unwrap();
+        let mut display = Display::new("no-manifest.raw".into(), raw);
+        display.aliases = Arc::new(vec![BTreeMap::from([("/top/out".into(), "v(top:out)".into())])]);
+        display.configure(&fschem::document::Properties::parse("node=/top/out".into()));
+        assert_eq!(display.selected, vec![true, false]);
+        assert_eq!(signal_label("v(top:out)", &display.aliases[0]), "/top/out (v(top:out))");
+        assert_eq!(signal_label("v(top.out)", &display.aliases[0]), "v(top.out)");
+        assert_eq!(display.raw.plots[0].variables[0].name, "v(top:out)");
+        assert!(display.open_plot(5).is_err());
+    }
+
     #[test]
     fn reload_preserves_selection_by_name_and_view() {
         let raw = |variables: &str| {
