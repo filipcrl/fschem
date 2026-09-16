@@ -66,7 +66,7 @@ optional JSON portable preparation config, existing backend/library selection,
 JSON-only stdout (or explicit output file), diagnostics on stderr/nonzero status,
 no GUI initialization, help and CLI regression tests.
 
-## Integration progress (completed implementation; independent review pending)
+## Integration progress (completed implementation; review fixes validated)
 
 Both finished lanes were merged into master with normal non-fast-forward merges;
 all lane commits and persistent worktrees are retained. Integration now provides:
@@ -102,7 +102,8 @@ Integration validation on macOS arm64 / CPython 3.12:
 
 Remaining work/limits:
 
-- **Independent reviewer gate remains required**; integration did not launch agents.
+- Independent reviews identified five concrete defects; all are fixed below. Parent
+  acceptance of the fix commits remains required.
 - Optional GUI configured Python script execution is **deferred**, not silently
   enabled. Choose the interpreter and run scripts explicitly from the terminal.
 - No standardized measurement persistence API was invented; native measurement text
@@ -115,3 +116,35 @@ Remaining work/limits:
   equivalence remain unsupported/unverified as documented in `portable.md`.
 - Execution remains POSIX-only; Python 3.10 and other OS GUI runtimes were not tested.
   Native code is trusted, not sandboxed; external models/modules are not hermetic.
+
+
+## Independent review fixes (single-writer acceptance stage)
+
+All five reported findings were current, not stale: flattened/root node collisions,
+backend-specific flags on labels, symlink redirection of runner outputs, explicit
+plot-index fallback on retries, and FIFO manifests blocking at open. Focused fixes
+reject ambiguous node names and flagged labels before emission, exclusively create
+logs/randomized manifest temporary files, retain explicit plot selection on retries,
+and reject nonregular manifests before opening. No public API or v1 schema changed.
+
+Regression/acceptance validation on macOS arm64 / CPython 3.12:
+
+- Release maturin wheel rebuilt and force-installed into `/tmp/fschem-core-venv`;
+  imported from site-packages, not the checkout. Full Python suite **89 passed**
+  with explicit absolute IHP/ADC/Xschem paths. Includes real native/portable dividers
+  and IHP inverter runs on both engines, plus ADC preparation on both engines.
+- Focused portable/runner suite: **58 passed**, including eight compiler and two
+  symlink regressions. No simulator launches for rejected static output symlinks.
+- `cargo test --all-targets`: **94 passed, 7 ignored**; includes invalid-selection
+  automatic retry and writerless FIFO regressions.
+- `cargo test --no-default-features --lib`: **31 passed, 4 ignored**.
+- `cargo clippy --all-targets -- -D warnings`: passed.
+
+FIFO rejection addresses the concrete blocking reproduction. Background manifest
+loading on slow filesystems is not implemented; synchronous metadata/read calls and
+filesystem replacement races remain explicit viewer limitations, not sandboxing
+claims. No new graphical/manual interaction smoke was performed in this fix stage;
+prior integration smoke and current headless GUI state/render tests are distinct.
+Portable AC/DC/noise, full ADC convergence, configured script launching, standardized
+measurement persistence, non-POSIX execution and hermetic dependencies remain out
+of scope. All lane branches/worktrees and external inputs were preserved.

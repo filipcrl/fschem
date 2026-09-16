@@ -50,7 +50,9 @@ uses them. Native-mode mappings remain identity-only. There is no colon/dot gues
   accessors, ternaries, comparisons and arbitrary native code are unsupported.
 - Schematic hierarchy is specialized **per instance**, then flattened. Interface
   pin order and schematic port membership are validated. Internal node/device names
-  use collision-free path hex encoding; `circuit.ir.json` retains human-readable paths.
+  use path hex encoding; collisions with preserved root node names (including
+  supplemental-source nodes, case-insensitively) fail preparation rather than short
+  nets. `circuit.ir.json` retains human-readable paths.
 - IHP `sg13_lv_nmos`/`sg13_lv_pmos` symbols bind only to matching existing subcircuit
   wrappers, never bare PSP devices. Terminal matching is by unique D/G/S/B names,
   reordered D/G/S/B in both engines. Resolve `w,l,ng,m,mm_ok` from symbol template then
@@ -67,7 +69,8 @@ cross-instance parameter references. Undefined names, cycles and non-finite resu
 error. Expressions are bounded to 16 KiB, 512 subexpressions and 128 recursive levels; hierarchy to 32.
 
 Unknown devices/properties, custom `device_model`, opaque/stopped hierarchy,
-backend-specific ignore/short flags and unknown/ambiguous scopes fail before launch.
+backend-specific ignore/short flags (including labels/noconn) and unknown/ambiguous
+scopes fail before launch.
 Native formatting annotations on otherwise supported symbols are not portable
 semantics: portable bindings use the structured attributes above, not
 `vacask_format`, `vacask_params` or native template expansion. Presentation properties

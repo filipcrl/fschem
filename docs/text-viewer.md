@@ -12,7 +12,7 @@ Controls: selectable monospace lines, line numbers, **Copy loaded text**, case-s
 - Only the first **4 MiB** are loaded. An explicit banner reports truncation. Follow is not a tail reader beyond that bound.
 - Text displays in **100-line pages**; next/previous page, search and go-to-line navigate these. Each displayed line is capped at **4096 Unicode characters** with an explicit marker, bounding pathological layout work. Copy loaded text retains the full loaded prefix, including undisplayed line suffixes.
 - Invalid UTF-8 is displayed with replacement characters. Copy is decoded text, not a byte-exact export. Search covers the loaded prefix, including long-line suffixes that are not displayed.
-- No syntax highlighting, editing, regex, cross-line search, run-manifest integration or script launch. Follow only polls the active tab (reactivating catches up). No OS filesystem watcher or worker cancellation for stalled filesystem calls.
+- No syntax highlighting, editing, regex, cross-line search or script launch. Run-manifest navigation is documented in [python.md](python.md#runjson-schema-version-1-gui-integration-contract). Follow only polls the active tab (reactivating catches up). No OS filesystem watcher or worker cancellation for stalled filesystem calls.
 
 ## Validation
 

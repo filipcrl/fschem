@@ -198,7 +198,9 @@ supported. Use a new directory. The manifest is inspectable without execution.
 ## `run.json` schema version 1 (GUI integration contract)
 
 UTF-8 JSON object, atomically replaced after writing/fsyncing a sibling temporary
-file. Readers may see a complete earlier lifecycle state, never half-written
+file created exclusively with a randomized name. Simulator logs are also created
+exclusively; pre-existing outputs (including dangling log symlinks) are rejected
+before launching. Readers may see a complete earlier lifecycle state, never half-written
 JSON. Additive fields may be added; consumers must ignore unknown keys and reject
 unsupported `schema_version`. Manifest properties are a detached JSON snapshot.
 All timestamps are ISO-8601 UTC strings; unset values are JSON null.
@@ -297,6 +299,8 @@ The GUI validates v1, statuses, result IDs/mappings and contained relative paths
 (including symlinks); missing/partial files stay visible but unavailable. It offers
 original source, generated deck, source snapshot, staged inputs/IR and log navigation,
 and opens each named result at its exact plot index in the detached graph window.
+An unavailable explicit index remains unavailable on automatic retry, never falling
+back to another plot.
 Native measurement text is available in the log. An optional additive
 `artifacts.measurements` relative text/JSON filename is supported, but the runner
 currently does **not** emit a standardized measurements file/API.
@@ -307,8 +311,11 @@ schematic graph node selections. No colon/dot guessing is performed. A custom-na
 manifest is navigable, but automatic raw aliases require the standard `run.json` name.
 
 The GUI is an inspector, not the Python integrity/reopening API: it bounds manifests
-at 4 MiB and validates graph aliases against parsed plot names and signal lists;
+at 4 MiB, rejects nonregular manifest files before opening (including FIFOs),
+and validates graph aliases against parsed plot names and signal lists;
 it does not verify recorded SHA-256 hashes. Use `Run.open` for hash-verified results.
+Manifest loading is still synchronous: slow filesystem metadata/reads can stall
+the UI, and files can change after the regular-file check.
 Files on disk can change after inspection; neither viewer is a malicious-filesystem
 sandbox. Opening manifests, scripts or sources never runs code. Original schematic
 source navigation opens the existing editor; artifact text is read-only.

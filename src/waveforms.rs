@@ -209,7 +209,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut state = WindowState::default();
         state.load_selected(&ctx, path.clone(), Some(5));
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while state.loading.is_some() {
                 assert!(std::time::Instant::now() < deadline);
@@ -219,6 +219,9 @@ mod tests {
             assert!(state.error.is_some());
             assert!(state.data.is_none());
             assert_eq!(state.selected_plot, Some(5));
+            if attempt == 1 {
+                break;
+            }
             state.checked = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| state.contents(ui));
