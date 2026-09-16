@@ -1390,6 +1390,24 @@ fn trace_color(index: usize) -> Color32 {
 mod tests {
     use super::*;
     #[test]
+    fn raw_open_discovers_matching_manifest_aliases_only() {
+        let root = std::env::temp_dir().join(format!("fschem-graph-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("op.raw");
+        std::fs::write(&path, b"Title: test\nPlotname: Operating Point\nFlags: real\nNo. Variables: 1\nNo. Points: 1\nVariables:\n0 v(out) voltage\nValues:\n0 2\n").unwrap();
+        let mut manifest = serde_json::json!({"schema_version":1,"status":"succeeded","backend":"ngspice","mode":"portable","source":"/source.sch","analyses":{},"artifacts":{"deck":"circuit.spice","original_deck":"original.deck","source_snapshot":"source.sch","log":"simulator.log","inputs":[]},"diagnostics":[],"results":[{"id":"op.raw#0","path":"op.raw","plot_index":0,"name":"Operating Point","analysis_name":"bias","signals":["v(out)"],"signal_map":{"v(out)":"v(out)","/OUT":"v(out)"}}]});
+        let manifest_path = root.join("run.json");
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        let display = Display::new(path.clone(), RawFile::open(&path).unwrap());
+        assert_eq!(display.aliases[0]["/OUT"], "v(out)");
+        assert!(display.traces.values().any(|trace| trace.label.contains("/OUT (v(out))")));
+        manifest["results"][0]["name"] = "Wrong plot".into();
+        std::fs::write(&manifest_path, manifest.to_string()).unwrap();
+        assert!(Display::new(path.clone(), RawFile::open(&path).unwrap()).aliases[0].is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn canonical_aliases_preserve_native_names_and_configure_graphs() {
         let raw = RawFile::parse(b"Title: test\nPlotname: Operating Point\nFlags: real\nNo. Variables: 2\nNo. Points: 1\nVariables:\n0 v(top:out) voltage\n1 v(top.out) voltage\nValues:\n0 2\n3\n").unwrap();
         let mut display = Display::new("no-manifest.raw".into(), raw);

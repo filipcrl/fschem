@@ -1,6 +1,9 @@
 //! Read-only consumer of the Python runner's run.json v1. Never launches code.
 use serde::Deserialize;
-use std::{collections::BTreeMap, path::{Component, Path, PathBuf}};
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path, PathBuf},
+};
 
 #[derive(Debug, Deserialize)]
 pub struct Manifest {
@@ -33,53 +36,125 @@ pub struct RunArtifact {
 }
 impl RunArtifact {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let path = if path.is_dir() { path.join("run.json") } else { path.to_owned() };
-        let path = path.canonicalize().map_err(|e| format!("{}: {e}", path.display()))?;
+        let path = if path.is_dir() {
+            path.join("run.json")
+        } else {
+            path.to_owned()
+        };
+        let path = path
+            .canonicalize()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let root = path.parent().ok_or("manifest has no parent")?.to_owned();
         // Bound manifest memory, including malicious/unintentionally huge JSON.
         use std::io::Read;
         let mut bytes = Vec::new();
-        std::fs::File::open(&path).map_err(|e| e.to_string())?.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        if bytes.len() > 4 * 1024 * 1024 { return Err("run manifest exceeds 4 MiB".into()); }
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| format!("invalid run manifest: {e}"))?;
-        if manifest.schema_version != 1 { return Err("unsupported run manifest version".into()); }
-        if !["prepared", "running", "succeeded", "failed", "cancelled", "timed_out"].contains(&manifest.status.as_str()) { return Err("invalid run status".into()); }
-        if !["ngspice", "vacask"].contains(&manifest.backend.as_str()) || !["native", "portable"].contains(&manifest.mode.as_str()) { return Err("invalid run backend/mode".into()); }
-        if !manifest.source.is_absolute() || !manifest.analyses.is_object() { return Err("invalid source/analyses".into()); }
-        if manifest.status != "succeeded" && !manifest.results.is_empty() { return Err("partial run must not publish results".into()); }
+        std::fs::File::open(&path)
+            .map_err(|e| e.to_string())?
+            .take(4 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err("run manifest exceeds 4 MiB".into());
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid run manifest: {e}"))?;
+        if manifest.schema_version != 1 {
+            return Err("unsupported run manifest version".into());
+        }
+        if ![
+            "prepared",
+            "running",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "timed_out",
+        ]
+        .contains(&manifest.status.as_str())
+        {
+            return Err("invalid run status".into());
+        }
+        if !["ngspice", "vacask"].contains(&manifest.backend.as_str())
+            || !["native", "portable"].contains(&manifest.mode.as_str())
+        {
+            return Err("invalid run backend/mode".into());
+        }
+        if !manifest.source.is_absolute() || !manifest.analyses.is_object() {
+            return Err("invalid source/analyses".into());
+        }
+        if manifest.status != "succeeded" && !manifest.results.is_empty() {
+            return Err("partial run must not publish results".into());
+        }
         let mut files = Vec::new();
         for key in ["deck", "original_deck", "source_snapshot", "log"] {
-            let relative = manifest.artifacts.get(key).and_then(|v| v.as_str()).ok_or_else(|| format!("missing artifact {key}"))?;
+            let relative = manifest
+                .artifacts
+                .get(key)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("missing artifact {key}"))?;
             files.push((key.to_owned(), contained(&root, relative)?));
         }
-        let inputs = manifest.artifacts.get("inputs").and_then(|v| v.as_array()).ok_or("invalid artifact inputs")?;
-        for input in inputs { let value = input.as_str().ok_or("invalid input path")?; files.push((format!("input: {value}"), contained(&root, value)?)); }
+        let inputs = manifest
+            .artifacts
+            .get("inputs")
+            .and_then(|v| v.as_array())
+            .ok_or("invalid artifact inputs")?;
+        for input in inputs {
+            let value = input.as_str().ok_or("invalid input path")?;
+            files.push((format!("input: {value}"), contained(&root, value)?));
+        }
         // Optional additive measurement file; not currently emitted by the runner.
         if let Some(value) = manifest.artifacts.get("measurements") {
-            files.push(("measurements".into(), contained(&root, value.as_str().ok_or("invalid measurements path")?)?));
+            files.push((
+                "measurements".into(),
+                contained(&root, value.as_str().ok_or("invalid measurements path")?)?,
+            ));
         }
         let mut ids = std::collections::BTreeSet::new();
         for result in &manifest.results {
             contained(&root, &result.path)?;
-            if !ids.insert(&result.id) || result.id != format!("{}#{}", result.path, result.plot_index) || result.signal_map.values().any(|v| !result.signals.contains(v)) {
+            if !ids.insert(&result.id)
+                || result.id != format!("{}#{}", result.path, result.plot_index)
+                || result
+                    .signal_map
+                    .values()
+                    .any(|v| !result.signals.contains(v))
+            {
                 return Err("invalid result identity or signal mapping".into());
             }
         }
-        Ok(Self { path, root, manifest, files })
+        Ok(Self {
+            path,
+            root,
+            manifest,
+            files,
+        })
     }
 }
 /// Reject traversal and symlink escapes even when a descendant is missing.
 pub fn contained(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let relative = Path::new(relative);
-    if relative.as_os_str().is_empty() || relative.components().any(|c| !matches!(c, Component::Normal(_))) { return Err("artifact path must be relative and contained".into()); }
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err("artifact path must be relative and contained".into());
+    }
     let path = root.join(relative);
     let mut ancestor = path.as_path();
     loop {
         match ancestor.canonicalize() {
-            Ok(resolved) => { if !resolved.starts_with(root) { return Err("artifact symlink escapes run directory".into()); } break; }
+            Ok(resolved) => {
+                if !resolved.starts_with(root) {
+                    return Err("artifact symlink escapes run directory".into());
+                }
+                break;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // A broken symlink is not a legitimate missing artifact.
-                if std::fs::symlink_metadata(ancestor).is_ok() { return Err("broken artifact symlink".into()); }
+                if std::fs::symlink_metadata(ancestor).is_ok() {
+                    return Err("broken artifact symlink".into());
+                }
                 ancestor = ancestor.parent().ok_or("invalid artifact path")?;
             }
             Err(error) => return Err(error.to_string()),
@@ -101,11 +176,23 @@ mod tests {
         write(&value);
         let run = RunArtifact::open(&root).unwrap();
         assert!(!run.files[0].1.exists());
-        value["schema_version"] = 2.into(); write(&value); assert!(RunArtifact::open(&path).is_err());
-        value["schema_version"] = 1.into(); value["status"] = "unknown".into(); write(&value); assert!(RunArtifact::open(&path).is_err());
-        value["status"] = "failed".into(); value["artifacts"]["deck"] = "../outside".into(); write(&value); assert!(RunArtifact::open(&path).is_err());
+        value["schema_version"] = 2.into();
+        write(&value);
+        assert!(RunArtifact::open(&path).is_err());
+        value["schema_version"] = 1.into();
+        value["status"] = "unknown".into();
+        write(&value);
+        assert!(RunArtifact::open(&path).is_err());
+        value["status"] = "failed".into();
+        value["artifacts"]["deck"] = "../outside".into();
+        write(&value);
+        assert!(RunArtifact::open(&path).is_err());
         assert!(contained(&root, "/absolute").is_err());
-        #[cfg(unix)] { std::os::unix::fs::symlink(std::env::temp_dir(), root.join("escape")).unwrap(); assert!(contained(&root, "escape/missing").is_err()); }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(std::env::temp_dir(), root.join("escape")).unwrap();
+            assert!(contained(&root, "escape/missing").is_err());
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -65,3 +65,53 @@ integration lane owns CLI dispatch in `main.rs`: `--dump-ir STAGE FILE.sch`,
 optional JSON portable preparation config, existing backend/library selection,
 JSON-only stdout (or explicit output file), diagnostics on stderr/nonzero status,
 no GUI initialization, help and CLI regression tests.
+
+## Integration progress (completed implementation; independent review pending)
+
+Both finished lanes were merged into master with normal non-fast-forward merges;
+all lane commits and persistent worktrees are retained. Integration now provides:
+
+- `--dump-ir` CLI with backend/library selection, strict portable JSON config,
+  JSON-only stdout and fresh-file-only output (cannot replace source/config/symbols).
+- `--open-run DIRECTORY|MANIFEST`, reloadable read-only run navigation with status,
+  original source, analyses, exact result plot selection, decks/log/inputs/IR and
+  optional measurement text. V1/status/path checks reject invalid/escaping paths;
+  missing and prepared/failed artifacts are inspectable without execution.
+- Headless `fschem.viewer.open_run(path, *, executable="fschem")`, launching an
+  external GUI with an argument list. The wheel intentionally excludes the GUI.
+- Standard sibling manifests supply validated canonical aliases to ordinary raw
+  opening and existing schematic graphs; native names remain visible and intact.
+  Detached graph windows remain unchanged in architecture.
+- Updated installation, wheel, IR, portable/native and ADC-oriented documentation.
+
+Integration validation on macOS arm64 / CPython 3.12:
+
+- Installed-wheel Python suite: **79 passed**, with explicit external IHP/ADC/device
+  paths. Wheel built with maturin and imported from site-packages, not source.
+- `cargo test --all-targets`: **92 passed, 7 ignored**.
+- `cargo test --no-default-features --lib`: **31 passed, 4 ignored**.
+- Both full `cargo clippy --all-targets -- -D warnings` and headless-library clippy
+  passed after narrow GUI lint corrections (no unrelated mass formatting).
+- Real native and portable divider runs passed on ngspice and VACASK; portable
+  IHP inverter executions passed both engines, and full ADC testbench preparation
+  passed both. External inputs were read-only; outputs are under
+  `/tmp/fschem-integration.aQA6Nd`.
+- GUI smoke: schematic demo, explicit Python text, and succeeded run artifacts.
+  Run-view screenshot inspected; installed Python launcher also started the GUI
+  successfully and its returned process was explicitly terminated after checking.
+
+Remaining work/limits:
+
+- **Independent reviewer gate remains required**; integration did not launch agents.
+- Optional GUI configured Python script execution is **deferred**, not silently
+  enabled. Choose the interpreter and run scripts explicitly from the terminal.
+- No standardized measurement persistence API was invented; native measurement text
+  remains in simulator logs. Optional `artifacts.measurements` navigation is additive.
+- GUI inspection does not hash-verify files (use Python `Run.open`); aliases require
+  matching parsed names/signals and a standard sibling `run.json`. Manifest reads
+  are bounded at 4 MiB. Source/graph/text navigation has automated/state/render
+  coverage, not a complete manual mouse/keyboard workflow certification.
+- Portable AC/DC/noise, full ADC convergence/accuracy/noise and native-tolerance
+  equivalence remain unsupported/unverified as documented in `portable.md`.
+- Execution remains POSIX-only; Python 3.10 and other OS GUI runtimes were not tested.
+  Native code is trusted, not sandboxed; external models/modules are not hermetic.
