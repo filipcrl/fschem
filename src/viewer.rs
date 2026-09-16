@@ -2020,8 +2020,10 @@ impl Viewer {
                     {
                         self.show_diagnostics = true;
                     }
+                } else if let Some(text) = &self.text {
+                    ui.label(format!("Read-only text · {}", text.path.display()));
                 } else {
-                    ui.label("Open a .sch or .sym file, or drag one into this window");
+                    ui.label("Open a schematic or text file, or drag one into this window");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.show_fps && self.fps > 0. {
@@ -2155,6 +2157,9 @@ impl Viewer {
                     } else if selected_instances.is_empty() {
                         ui.weak("Click a component, graph or wire to select it. Left-drag to box select. Hold Shift to add to the selection. G: move · C: copy · W: wire · i: symbol · e: schematic · Shift-E: up.");
                     }
+                } else if let Some(text) = &self.text {
+                    ui.label(text.path.display().to_string());
+                    ui.weak("Read-only text. Files are never executed or modified. Use the viewer controls to search, reload or follow changes.");
                 } else { ui.weak("No document open"); }
             });
         });
