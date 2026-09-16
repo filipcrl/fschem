@@ -242,3 +242,24 @@ fn real_simulators_run_from_the_cli() {
         assert!(!data.plots.is_empty());
     }
 }
+
+#[test]
+fn ir_is_json_only_and_rejects_conflicts_and_source_overwrite() {
+    let dir = Workspace::new();
+    for stage in ["parsed", "resolved"] {
+        let output = dir.run(&["--dump-ir", stage, "spice.sch"]);
+        success(&output);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["stage"], stage);
+    }
+    let source = fs::read(dir.0.join("spice.sch")).unwrap();
+    for args in [
+        vec!["--dump-ir", "parsed", "--output", "spice.sch", "spice.sch"],
+        vec!["--dump-ir", "parsed", "--check", "spice.sch"],
+        vec!["--dump-ir", "bad", "spice.sch"],
+        vec!["--ir-config", "missing.json", "spice.sch"],
+    ] { assert!(!dir.run(&args).status.success()); }
+    assert_eq!(source, fs::read(dir.0.join("spice.sch")).unwrap());
+    success(&dir.run(&["--dump-ir", "parsed", "--output", "ir.json", "spice.sch"]));
+    serde_json::from_slice::<serde_json::Value>(&fs::read(dir.0.join("ir.json")).unwrap()).unwrap();
+}
