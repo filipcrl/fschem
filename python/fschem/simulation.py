@@ -9,6 +9,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from types import MappingProxyType
@@ -49,13 +50,17 @@ def _platform():
 
 
 def _atomic(directory, data):
-    temporary = directory / ".run.json.tmp"
-    with temporary.open("w") as stream:
-        json.dump(data, stream, indent=2, ensure_ascii=False, allow_nan=False)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, directory / "run.json")
+    fd, name = tempfile.mkstemp(prefix=".run.json.", suffix=".tmp", dir=directory)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(data, stream, indent=2, ensure_ascii=False, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, directory / "run.json")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _artifact(directory, name):
@@ -340,7 +345,9 @@ class Run:
             for name, digest in data["input_sha256"].items():
                 if _digest(_artifact(self.directory, name)) != digest:
                     raise ValueError(f"prepared input changed: {name}")
-            if list(self.directory.glob("*.raw")) or (self.directory / "simulator.log").exists():
+            if (self.directory / ".run.json.tmp").is_symlink():
+                raise ValueError("prepared run contains a symlink at the manifest temporary path")
+            if list(self.directory.glob("*.raw")) or os.path.lexists(self.directory / "simulator.log"):
                 raise ValueError("prepared run already contains simulator outputs")
             environment = dict(os.environ)
             if env is not None:
@@ -363,7 +370,7 @@ class Run:
                                  "environment_policy": "inherited plus explicit overrides; values allowlisted",
                                  "returncode": None}
             _atomic(self.directory, data)
-            with (self.directory / "simulator.log").open("wb") as log:
+            with (self.directory / "simulator.log").open("xb") as log:
                 process = subprocess.Popen(command, cwd=self.directory, env=environment,
                                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                                            start_new_session=True)

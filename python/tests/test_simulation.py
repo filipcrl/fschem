@@ -295,3 +295,22 @@ def test_nonposix_run_refuses_before_artifacts(tmp_path, monkeypatch):
     with pytest.raises(fschem.UnsupportedPlatform, match='POSIX'):
         p.run(directory=tmp_path / 'unsupported')
     assert not (tmp_path / 'unsupported').exists()
+
+
+@pytest.mark.parametrize('output', ['simulator.log', '.run.json.tmp'])
+def test_runner_output_symlinks_do_not_escape_or_launch(tmp_path, output):
+    run = prepared().write(tmp_path / 'run')
+    outside = tmp_path / 'outside'
+    if output == '.run.json.tmp':
+        outside.write_text('sentinel')
+    (run.directory / output).symlink_to(outside)
+    launched = tmp_path / 'launched'
+    engine = fake(tmp_path, f'Path({str(launched)!r}).touch()\n')
+    with pytest.raises(fschem.SimulationError):
+        run.execute(executable=engine)
+    assert not launched.exists()
+    if output == '.run.json.tmp':
+        assert outside.read_text() == 'sentinel'
+    else:
+        assert not outside.exists()
+    assert json.loads((run.directory / 'run.json').read_text())['status'] == 'failed'
