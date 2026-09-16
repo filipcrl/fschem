@@ -10,6 +10,7 @@ pub struct Options {
     pub local_parameters: BTreeMap<String, BTreeMap<String, String>>,
     /// Exact /instance/code paths or absolute-source.sch#code identifiers.
     pub exclude: BTreeSet<String>,
+    pub sources: BTreeMap<String, (String, Vec<String>, String)>,
 }
 pub struct Circuit {
     pub deck: String,
@@ -170,6 +171,40 @@ impl Compiler {
             self.used_scopes.insert(scope_path.into());
         }
         let sheet = resolve_sheet(&mut self.library, doc, source, ports, None)?;
+        let mut node_map = BTreeMap::from([("0".into(), "0".into())]);
+        for net in &sheet.pin_names {
+            identifier(net)?;
+            let node = if net == "0" {
+                "0".into()
+            } else if let Some(n) = connections.get(&net.to_ascii_lowercase()) {
+                n.clone()
+            } else if path.is_empty() {
+                net.clone()
+            } else {
+                format!("n{}", encoded(&format!("{path}/{net}")))
+            };
+            node_map.insert(net.to_ascii_lowercase(), node.clone());
+            self.signals.insert(format!("{path}/{net}"), node);
+        }
+        if path.is_empty() {
+            for (key, (_, nodes, _)) in &self.options.sources {
+                root_name(key)?;
+                for node in nodes {
+                    let node = root_name(node)?;
+                    if !node_map.contains_key(&node.to_ascii_lowercase()) {
+                        node_map.insert(node.to_ascii_lowercase(), node.into());
+                    }
+                }
+            }
+            for (_, (_, nodes, _)) in &self.options.sources {
+                for node in nodes {
+                    self.signals.insert(
+                        node.clone(),
+                        node_map[&root_name(node)?.to_ascii_lowercase()].clone(),
+                    );
+                }
+            }
+        }
         let mut names = BTreeSet::new();
         for c in &sheet.components {
             if is_label(c.kind()) || c.kind() == "noconn" {
@@ -219,6 +254,52 @@ impl Compiler {
                 self.signals.insert(format!("{path}/{net}"), node.clone());
                 nodes.push(node);
             }
+            let mut allowed: BTreeSet<&str> = [
+                "name",
+                "footprint",
+                "device",
+                "lab",
+                "hide",
+                "hide_texts",
+                "highlight",
+                "format",
+                "spectre_format",
+                "vacask_format",
+                "vacask_params",
+                "vacask_model",
+                "only_toplevel",
+                "savecurrent",
+                "spice_ignore",
+                "vacask_ignore",
+                "spice_short",
+                "spice_stop",
+                "vacask_stop",
+                "device_model",
+            ]
+            .into_iter()
+            .collect();
+            let fields: &[&str] = match c.kind() {
+                "subcircuit" => &[],
+                "nmos" | "pmos" => &["w", "l", "ng", "m", "mm_ok", "model", "spiceprefix"],
+                "source" => &["VAR", "FUNC", "m"],
+                "resistor" | "capacitor" | "inductor" => &["value", "m"],
+                _ => &["value"],
+            };
+            allowed.extend(fields.iter().copied());
+            if c.kind() == "subcircuit" {
+                allowed.extend(c.defaults.entries.iter().map(|(k, _)| k.as_str()));
+            }
+            for (key, _) in c
+                .info
+                .properties
+                .entries
+                .iter()
+                .chain(c.defaults.entries.iter())
+            {
+                if !allowed.contains(key.as_str()) {
+                    return Err(format!("{instance}: unsupported property {key}"));
+                }
+            }
             let result = if c.kind() == "subcircuit" {
                 if c.flag("spice_stop") || c.flag("vacask_stop") {
                     return Err(format!("{instance}: stopped/opaque hierarchy unsupported"));
@@ -250,8 +331,10 @@ impl Compiler {
                     }
                 }
                 // Defaults are defined in their own scope; instance expressions use the caller scope.
-                let mut child = resolve_parameters(&defaults, &BTreeMap::new())?;
-                child.extend(overrides);
+                for (key, value) in overrides {
+                    defaults.insert(key, format!("{value:e}"));
+                }
+                let child = resolve_parameters(&defaults, &BTreeMap::new())?;
                 let interface = defaults.keys().cloned().collect();
                 let DocumentTarget::File(target) =
                     navigation::descend(&c.info, Descent::Schematic, &self.library.paths)?
@@ -270,9 +353,47 @@ impl Compiler {
                     depth + 1,
                 )
             } else {
-                self.device(c, &nodes, &instance, &scope)
+                self.device(c, &nodes, &instance, &scope, &node_map)
             };
             result.map_err(|e| format!("{instance}: {e}"))?;
+        }
+        if path.is_empty() {
+            for (key, (kind, nodes, value)) in &self.options.sources {
+                let name = root_name(key)?;
+                if !names.insert(name.to_ascii_lowercase()) {
+                    return Err(format!("supplemental source name collision: {key}"));
+                }
+                if nodes.len() != 2 {
+                    return Err("supplemental source requires exactly two terminals".into());
+                }
+                let prefix = match kind.as_str() {
+                    "voltage" => 'v',
+                    "current" => 'i',
+                    _ => return Err(format!("unsupported supplemental source kind {kind}")),
+                };
+                let nodes = nodes
+                    .iter()
+                    .map(|n| root_name(n).map(|n| node_map[&n.to_ascii_lowercase()].clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if nodes[0] == nodes[1] {
+                    return Err("supplemental source terminals must differ".into());
+                }
+                let params = waveform(value, &scope, self.vacask)?;
+                let name = format!("{prefix}{}", encoded(key));
+                if self.vacask {
+                    let model = if prefix == 'v' { "vsource" } else { "isource" };
+                    self.models.insert(format!("model fschem_{model} {model}"));
+                    append(
+                        &mut self.body,
+                        &format!("{name} ({}) fschem_{model} {params}", nodes.join(" ")),
+                    );
+                } else {
+                    append(
+                        &mut self.body,
+                        &format!("{name} {} {params}", nodes.join(" ")),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -282,14 +403,47 @@ impl Compiler {
         nodes: &[String],
         path: &str,
         scope: &BTreeMap<String, f64>,
+        node_map: &BTreeMap<String, String>,
     ) -> Result<(), String> {
         let value = |key: &str| -> Result<f64, String> {
             eval(c.value(key).ok_or_else(|| format!("missing {key}"))?, scope)
         };
+        if c.kind() == "source" {
+            if c.value("VAR") != Some("V")
+                || nodes.len() != 2
+                || c.value("m")
+                    .map(|s| eval(s, scope))
+                    .transpose()?
+                    .unwrap_or(1.)
+                    != 1.
+            {
+                return Err(
+                    "only unity-multiplicity behavioral voltage sources are supported".into(),
+                );
+            }
+            let expr = Expr::parse(c.value("FUNC").ok_or("missing behavioral FUNC")?)?;
+            let value = behavior(&expr, scope, node_map)?;
+            let name = format!("b{}", encoded(path));
+            let line = if self.vacask {
+                format!("{name} ({}) v={value}", nodes.join(" "))
+            } else {
+                format!("{name} {} V={value}", nodes.join(" "))
+            };
+            append(&mut self.body, &line);
+            return Ok(());
+        }
         let sym = c.symname();
         let ihp = matches!(sym.as_str(), "sg13_lv_nmos" | "sg13_lv_pmos")
             && matches!(c.kind(), "nmos" | "pmos");
         let (prefix, model, params, mut nodes) = if ihp {
+            if c.value("spiceprefix")
+                .is_some_and(|s| !s.eq_ignore_ascii_case("x"))
+            {
+                return Err("IHP requires subcircuit wrapper prefix X".into());
+            }
+            if value("ng")?.fract() != 0. {
+                return Err("IHP ng must be an integer".into());
+            }
             if c.value("model") != Some(sym.as_str()) {
                 return Err("IHP symbol/model mismatch".into());
             }
@@ -344,7 +498,7 @@ impl Compiler {
                 return Err("custom device_model requires an explicit technology binding".into());
             }
             let params = if prefix == 'v' || prefix == 'i' {
-                source(
+                waveform(
                     c.value("value").ok_or("missing source value")?,
                     scope,
                     self.vacask,
@@ -398,7 +552,47 @@ impl Compiler {
         Ok(())
     }
 }
-fn source(text: &str, scope: &BTreeMap<String, f64>, vacask: bool) -> Result<String, String> {
+fn root_name(path: &str) -> Result<&str, String> {
+    let name = path
+        .strip_prefix('/')
+        .ok_or("supplemental paths must start with /")?;
+    identifier(name).map_err(|_| format!("supplemental sources require root-only paths: {path}"))
+}
+fn behavior(
+    expr: &Expr,
+    scope: &BTreeMap<String, f64>,
+    nodes: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    Ok(match expr {
+        Expr::Voltage(a, b) => {
+            let node = |s: &str| {
+                nodes
+                    .get(&s.to_ascii_lowercase())
+                    .cloned()
+                    .ok_or_else(|| format!("undefined behavioral voltage node {s}"))
+            };
+            let a = node(a)?;
+            if let Some(b) = b {
+                format!("v({a},{})", node(b)?)
+            } else {
+                format!("v({a})")
+            }
+        }
+        Expr::Unary(op, v) => format!("({op}{})", behavior(v, scope, nodes)?),
+        Expr::Binary(op, a, b) => {
+            if *op == '^' {
+                return Err("behavioral powers unsupported".into());
+            }
+            format!(
+                "({} {op} {})",
+                behavior(a, scope, nodes)?,
+                behavior(b, scope, nodes)?
+            )
+        }
+        _ => format!("{:e}", expr.evaluate(scope)?),
+    })
+}
+fn waveform(text: &str, scope: &BTreeMap<String, f64>, vacask: bool) -> Result<String, String> {
     let text = text.trim();
     let upper = text.to_ascii_uppercase();
     for kind in ["PULSE", "PWL"] {
@@ -499,17 +693,17 @@ mod tests {
     fn waveforms() {
         let scope = BTreeMap::from([("T".into(), 1e-9)]);
         assert!(
-            source("PULSE(0 1 {2*T} 1p 1p {T} {4*T})", &scope, true)
+            waveform("PULSE(0 1 {2*T} 1p 1p {T} {4*T})", &scope, true)
                 .unwrap()
                 .contains("period=4e-9")
         );
         assert!(
-            source("PWL(0 0 1n 1)", &scope, true)
+            waveform("PWL(0 0 1n 1)", &scope, true)
                 .unwrap()
                 .contains("wave=[")
         );
         for s in ["SIN(0 1 1k)", "PWL(1 0 0 1)", "PULSE(0 1)"] {
-            assert!(source(s, &scope, false).is_err());
+            assert!(waveform(s, &scope, false).is_err());
         }
     }
     #[test]

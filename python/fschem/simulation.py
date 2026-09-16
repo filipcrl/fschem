@@ -85,12 +85,12 @@ def _stop(process):
 class Simulation:
     """Explicit native or portable experiment; portable methods return self."""
     def __init__(self, circuit: Schematic, *, mode: str, parameters=None,
-                 corners=None, temperature_c=None, local_parameters=None, exclude=()):
+                 corners=None, temperature_c=None, local_parameters=None, exclude=(), sources=None):
         from ._portable import expressions, number
         if mode not in {"native", "portable"}:
             raise ValueError("mode must be 'native' or 'portable'")
         if mode == "native" and (parameters is not None or corners is not None or
-                                 temperature_c is not None or local_parameters is not None or exclude):
+                                 temperature_c is not None or local_parameters is not None or exclude or sources is not None):
             raise ValueError("native mode does not accept portable parameter/corner/temperature overrides")
         self.circuit = circuit
         self.mode = mode
@@ -98,6 +98,12 @@ class Simulation:
         self.local_parameters = MappingProxyType({k: MappingProxyType(expressions(v))
                                                   for k, v in (local_parameters or {}).items()})
         self.exclude = frozenset(exclude)
+        normalized = {}
+        for key, spec in (sources or {}).items():
+            if set(spec) != {"kind", "nodes", "value"} or isinstance(spec["nodes"], str):
+                raise ValueError("source requires exactly kind, nodes, value")
+            normalized[key] = (spec["kind"], tuple(spec["nodes"]), expressions({"value": spec["value"]})["value"])
+        self.sources = MappingProxyType(normalized)
         self.corners = corners
         self.temperature_c = number(27 if temperature_c is None else temperature_c, "temperature_c")
         if self.temperature_c <= -273.15:
@@ -175,7 +181,7 @@ class PreparedRun:
     files: Mapping[str, str]
     minimum_plots: int
     mode: str = "native"
-    portable_metadata: Mapping | None = None
+    portable_metadata: str | None = None
 
     @property
     def deck(self):
@@ -209,9 +215,9 @@ class PreparedRun:
                 "results": [], "diagnostics": [],
             }
             if self.portable_metadata is not None:
-                data["portable"] = self.portable_metadata
-                data["parameters"] = dict(self.portable_metadata["parameters"])
-                data["analyses"].update(origin="portable", specifications=self.portable_metadata["analyses"])
+                data["portable"] = json.loads(self.portable_metadata)
+                data["parameters"] = dict(data["portable"]["parameters"])
+                data["analyses"].update(origin="portable", specifications=data["portable"]["analyses"])
             _atomic(directory, data)
         finally:
             claim.unlink()
@@ -272,6 +278,7 @@ class Run:
             result = cached[item["path"]][item["plot_index"]]
             if result.name != item["name"] or list(result.signals) != item["signals"]:
                 raise ValueError("raw metadata differs from manifest")
+            result.signal_map = MappingProxyType(dict(item["signal_map"]))
             results[item["id"]] = result
         if not results:
             raise ValueError("successful run has no results")
@@ -372,11 +379,19 @@ class Run:
                 for index, result in enumerate(plots):
                     if not result.signals or any(len(a) == 0 for a in result.signals.values()):
                         raise ValueError(f"empty raw analysis: {path.name}")
+                    signal_map = {name: name for name in result.signals}
+                    if data["mode"] == "portable":
+                        for canonical, node in data["portable"]["signal_map"].items():
+                            if data["backend"] == "ngspice":
+                                node = node.lower()
+                            candidate = f"v({node})" if f"v({node})" in result.signals else node
+                            if candidate in result.signals:
+                                signal_map[canonical] = candidate
                     published.append({"id": f"{path.name}#{index}", "name": result.name,
                                       "analysis_name": path.stem,
                                       "path": path.name, "plot_index": index, "sha256": _digest(path),
                                       "signals": list(result.signals),
-                                      "signal_map": {name: name for name in result.signals}})
+                                      "signal_map": signal_map})
             if len(published) < data["analyses"]["minimum_plots"]:
                 raise ValueError("simulator produced missing or incomplete raw analyses")
             data["results"] = published

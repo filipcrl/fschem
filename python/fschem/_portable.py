@@ -1,4 +1,5 @@
 """Portable experiment preparation; circuit and expression lowering live in Rust."""
+import json
 import math
 import re
 import tomli_w
@@ -37,7 +38,7 @@ def prepare(sim, backend):
     if not sim._analyses:
         raise ValueError("portable simulation requires at least one analysis")
     body, ihp, signals = sim.circuit._native.portable(
-        backend, dict(sim.parameters), {k: dict(v) for k, v in sim.local_parameters.items()}, set(sim.exclude))
+        backend, dict(sim.parameters), {k: dict(v) for k, v in sim.local_parameters.items()}, set(sim.exclude), dict(sim.sources))
     files = {}
     paths = {}
     prefix = ""
@@ -83,8 +84,9 @@ def prepare(sim, backend):
     files.update({filename: deck, "original.deck": deck, "source.sch": sim.circuit.source})
     metadata = {"parameters": dict(sim.parameters), "analyses": list(sim._analyses),
                 "local_parameters": {k: dict(v) for k, v in sim.local_parameters.items()},
+                "sources": {k: {"kind": v[0], "nodes": v[1], "value": v[2]} for k, v in sim.sources.items()},
                 "excluded_native_blocks": sorted(sim.exclude), "corners": sim.corners,
                 "temperature_c": sim.temperature_c, "signal_map": signals,
                 "technology": str(sim.circuit.project.technology) if ihp else None}
     return PreparedRun(backend, sim.circuit.path, filename, MappingProxyType(files),
-                       len(analyses), "portable", metadata)
+                       len(analyses), "portable", json.dumps(metadata, allow_nan=False))

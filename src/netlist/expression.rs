@@ -4,12 +4,17 @@ use std::collections::BTreeMap;
 pub enum Expr {
     Number(f64),
     Name(String),
+    Voltage(String, Option<String>),
     Unary(char, Box<Expr>),
     Binary(char, Box<Expr>, Box<Expr>),
 }
 impl Expr {
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
+        let text = text
+            .strip_prefix("\\{")
+            .and_then(|s| s.strip_suffix("\\}"))
+            .unwrap_or(text);
         let text = text
             .strip_prefix('{')
             .and_then(|s| s.strip_suffix('}'))
@@ -27,6 +32,9 @@ impl Expr {
     }
     pub fn evaluate(&self, scope: &BTreeMap<String, f64>) -> Result<f64, String> {
         let value = match self {
+            Self::Voltage(..) => {
+                return Err("voltage references are allowed only in behavioral expressions".into());
+            }
             Self::Number(v) => *v,
             Self::Name(n) => *scope
                 .get(n)
@@ -59,6 +67,23 @@ impl Parser<'_> {
         while self.text.get(self.at).is_some_and(u8::is_ascii_whitespace) {
             self.at += 1;
         }
+    }
+    fn node(&mut self) -> Result<String, String> {
+        self.space();
+        let start = self.at;
+        while self
+            .text
+            .get(self.at)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        {
+            self.at += 1;
+        }
+        if start == self.at {
+            return Err("expected literal voltage node".into());
+        }
+        Ok(std::str::from_utf8(&self.text[start..self.at])
+            .unwrap()
+            .into())
     }
     fn expr(&mut self, min: u8) -> Result<Expr, String> {
         self.space();
@@ -136,11 +161,29 @@ impl Parser<'_> {
             {
                 self.at += 1;
             }
-            Expr::Name(
-                std::str::from_utf8(&self.text[start..self.at])
-                    .unwrap()
-                    .into(),
-            )
+            let name = std::str::from_utf8(&self.text[start..self.at])
+                .unwrap()
+                .to_owned();
+            self.space();
+            if name.eq_ignore_ascii_case("v") && self.text.get(self.at) == Some(&b'(') {
+                self.at += 1;
+                let a = self.node()?;
+                self.space();
+                let b = if self.text.get(self.at) == Some(&b',') {
+                    self.at += 1;
+                    Some(self.node()?)
+                } else {
+                    None
+                };
+                self.space();
+                if self.text.get(self.at) != Some(&b')') {
+                    return Err("voltage requires one or two literal nodes".into());
+                }
+                self.at += 1;
+                Expr::Voltage(a, b)
+            } else {
+                Expr::Name(name)
+            }
         } else {
             return Err(format!("unsupported expression character {:?}", ch as char));
         };

@@ -19,6 +19,7 @@ class Result:
 
     def __init__(self, title: str, name: str, signals: Mapping[str, NDArray],
                  kinds: Mapping[str, str], scale_name: str | None):
+        self.signal_map = MappingProxyType({name: name for name in signals})
         self.title = title
         self.name = name
         self.signals = MappingProxyType(dict(signals))
@@ -34,7 +35,9 @@ class Result:
 
     @property
     def time(self) -> NDArray:
-        if self.scale_name is None or self.kinds[self.scale_name].lower() != "time":
+        if self.scale_name is None or not (self.kinds[self.scale_name].lower() == "time" or
+                (self.scale_name == "time" and self.kinds[self.scale_name] == "notype"
+                 and self.name == "Transient Analysis")):
             raise ValueError("plot does not have a time scale")
         return self[self.scale_name].real
 
@@ -45,6 +48,8 @@ class Result:
         return self[self.scale_name].real
 
     def voltage(self, node: str) -> NDArray:
+        if node.startswith("/") and node in self.signal_map:
+            return self[self.signal_map[node]]
         wrapped = f"v({node})"
         return self[wrapped if wrapped in self.signals else node]
 
