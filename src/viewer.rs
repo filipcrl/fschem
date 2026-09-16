@@ -39,6 +39,7 @@ fn format_grid_spacing(spacing: f64) -> String {
 
 pub struct Options {
     pub input: Option<PathBuf>,
+    pub open_as_text: bool,
     pub libraries: LibraryPaths,
     pub smoke_test: bool,
     pub screenshot: Option<PathBuf>,
@@ -945,7 +946,7 @@ impl Viewer {
             last_file_check: Instant::now(),
         };
         if let Some(path) = options.input {
-            viewer.action(ctx, Action::Open(path));
+            viewer.action(ctx, if options.open_as_text { Action::OpenText(path) } else { Action::Open(path) });
         } else if viewer.smoke || viewer.screenshot.is_some() {
             viewer.load(ctx, None, false);
         }
@@ -969,6 +970,7 @@ impl Viewer {
             );
             menu.sync(
                 self.current.is_some(),
+                self.text.is_some(),
                 self.can_export(),
                 self.loading.is_none()
                     && self
@@ -1713,6 +1715,7 @@ impl Viewer {
                         .color(Color32::from_rgb(120, 220, 160)),
                 );
                 ui.menu_button("File", |ui| {
+                    if ui.button("Open as text…").clicked() { actions.push(Action::OpenTextDialog); ui.close(); }
                     if ui.button("Open…     Ctrl/Command-O").clicked() {
                         actions.push(Action::OpenDialog);
                         ui.close();
@@ -1747,7 +1750,7 @@ impl Viewer {
                     }
                     if ui
                         .add_enabled(
-                            self.current.is_some(),
+                            self.current.is_some() || self.text.is_some(),
                             egui::Button::new("Reload     Ctrl/Command-R"),
                         )
                         .clicked()
@@ -2452,9 +2455,10 @@ impl Viewer {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if self.current.is_none() {
-            return;
-        }
+        if let Some(text) = &self.text {
+            if text.failed() && self.smoke { ctx.send_viewport_cmd(egui::ViewportCommand::Close); return; }
+            if !text.ready() { return; }
+        } else if self.current.is_none() { return; }
         if self.smoke || self.screenshot.is_some() {
             self.ready_frames += 1;
             ctx.request_repaint();
@@ -2767,6 +2771,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
+                open_as_text: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -2982,6 +2987,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
+                open_as_text: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3140,6 +3146,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
+                open_as_text: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3385,6 +3392,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
+                open_as_text: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3544,12 +3552,41 @@ mod tests {
     }
 
     #[test]
+    fn text_tabs_isolate_actions_and_preserve_dirty_schematic_hierarchy() {
+        let ctx = egui::Context::default();
+        let mut viewer = Viewer::new(&ctx, Options { input: None, open_as_text: false, libraries: LibraryPaths::default(), smoke_test: false, screenshot: None }, Arc::new(AtomicBool::new(false)));
+        let mut view = selection_view();
+        view.selected = BTreeSet::from([Selection::Instance(0)]);
+        view.delete_selection(&viewer.paths).unwrap();
+        let original = view.loaded.document.original().to_owned();
+        viewer.current = Some(view);
+        viewer.navigation_stack.push(selection_view());
+        viewer.action(&ctx, Action::OpenText(PathBuf::from("Cargo.toml")));
+        assert!(viewer.current.is_none());
+        assert!(viewer.navigation_stack.is_empty());
+        assert!(!viewer.can_save()); assert!(!viewer.can_export());
+        assert!(viewer.undo_label().is_none());
+        for action in [Action::Undo, Action::Redo, Action::Edit(Key::Backspace), Action::Save, Action::Back, Action::Descend(Descent::Symbol)] { viewer.action(&ctx, action); }
+        assert!(viewer.text.is_some());
+        viewer.switch_tab(0);
+        assert_eq!(viewer.current.as_ref().unwrap().loaded.document.original(), original);
+        assert!(viewer.current.as_ref().unwrap().modified());
+        assert_eq!(viewer.navigation_stack.len(), 1);
+        assert!(viewer.undo_label().is_some());
+        viewer.switch_tab(1);
+        viewer.close_tab(1);
+        assert_eq!(viewer.tabs.len(), 1);
+        assert!(viewer.current.as_ref().unwrap().modified());
+    }
+
+    #[test]
     fn tabs_preserve_unsaved_documents_and_undo_history() {
         let ctx = egui::Context::default();
         let mut viewer = Viewer::new(
             &ctx,
             Options {
                 input: None,
+                open_as_text: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3649,6 +3686,7 @@ mod tests {
             &ctx,
             Options {
                 input: Some(dir.join("parent.sch")),
+                open_as_text: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,
@@ -3733,6 +3771,7 @@ mod tests {
             &ctx,
             Options {
                 input: None,
+                open_as_text: false,
                 libraries: LibraryPaths::default(),
                 smoke_test: false,
                 screenshot: None,

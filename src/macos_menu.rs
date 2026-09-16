@@ -255,6 +255,7 @@ impl NativeMenu {
     pub fn sync(
         &self,
         document: bool,
+        text: bool,
         export: bool,
         selected: bool,
         back: bool,
@@ -263,7 +264,8 @@ impl NativeMenu {
     ) {
         for item in &self.items {
             match item.tag() {
-                2 | 3 => item.setEnabled(document),
+                2 => item.setEnabled(document || text),
+                3 => item.setEnabled(document),
                 12 | 20 => item.setEnabled(export),
                 13 | 14 => item.setEnabled(edit[1]),
                 100..=102 => item.setEnabled(edit[0]),

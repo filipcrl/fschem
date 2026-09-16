@@ -35,6 +35,7 @@ fn run() -> Result<(), String> {
     let mut inputs = Vec::new();
     let mut roots = Vec::new();
     let mut check = false;
+    let mut open_as_text = false;
     let mut verbose = false;
     let mut smoke_test = false;
     let mut screenshot = None;
@@ -47,7 +48,7 @@ fn run() -> Result<(), String> {
         match arg.to_str() {
             Some("--help" | "-h") => {
                 println!(
-                    "fschem [OPTIONS] [FILE.sch|FILE.sym]\n\n  -L, --library DIR  Add a symbol library search path (repeatable)\n  --netlist OUTPUT  Export a netlist without opening a window\n  --netlist-format FORMAT\n                   Netlist format: spice (default) or vacask\n  --simulate RAW   Run FILE.sch headlessly; save .raw, netlist and .log files\n  --simulator NAME Simulator for --simulate: ngspice (default) or vacask\n  --check PATH...   Check file syntax and lossless retention; recurse through directories\n  --verbose        Show all parser diagnostics in check mode\n  --smoke-test     Open, render three frames, then exit (demo if no file given)\n  --screenshot PNG Capture the egui window after loading\n\nCtrl/Command-O opens; Ctrl/Command-S saves; Ctrl/Command-Z undoes; Ctrl/Command-Shift-Z redoes.\nClick/Shift-click or left-drag selects; G moves; C copies; W wires; Backspace deletes.\nR/X/Y rotate or mirror while moving; left-click places; Esc cancels.\nMiddle/right-drag pans; wheel/pinch zooms; F fits. i: symbol, e: schematic, Shift-E: up.\nFile → Export SPICE netlist exports the current schematic.\nThe stroke font is built in. Source schematic files change only when saved."
+                    "fschem [OPTIONS] [FILE.sch|FILE.sym|TEXT]\n\n  -L, --library DIR  Add a symbol library search path (repeatable)\n  --netlist OUTPUT  Export a netlist without opening a window\n  --netlist-format FORMAT\n                   Netlist format: spice (default) or vacask\n  --simulate RAW   Run FILE.sch headlessly; save .raw, netlist and .log files\n  --simulator NAME Simulator for --simulate: ngspice (default) or vacask\n  --check PATH...   Check file syntax and lossless retention; recurse through directories\n  --verbose        Show all parser diagnostics in check mode\n  --open-text      Open any file as read-only text (including .sch)\n  --smoke-test     Open, render three frames, then exit (demo if no file given)\n  --screenshot PNG Capture the egui window after loading\n\nCtrl/Command-O opens; Ctrl/Command-S saves; Ctrl/Command-Z undoes; Ctrl/Command-Shift-Z redoes.\nClick/Shift-click or left-drag selects; G moves; C copies; W wires; Backspace deletes.\nR/X/Y rotate or mirror while moving; left-click places; Esc cancels.\nMiddle/right-drag pans; wheel/pinch zooms; F fits. i: symbol, e: schematic, Shift-E: up.\nFile → Export SPICE netlist exports the current schematic.\nThe stroke font is built in. Source schematic files change only when saved."
                 );
                 return Ok(());
             }
@@ -55,6 +56,7 @@ fn run() -> Result<(), String> {
                 args.next().ok_or("--library requires a directory")?,
             )),
             Some("--check") => check = true,
+            Some("--open-text") => open_as_text = true,
             Some("--netlist") => {
                 netlist = Some(PathBuf::from(
                     args.next().ok_or("--netlist requires an output path")?,
@@ -115,6 +117,9 @@ fn run() -> Result<(), String> {
             }
             _ => inputs.push(PathBuf::from(arg)),
         }
+    }
+    if open_as_text && (check || netlist.is_some() || simulate.is_some() || inputs.len() != 1) {
+        return Err("--open-text requires one file and cannot be combined with headless modes".into());
     }
     if netlist_format.is_some() && netlist.is_none() {
         return Err("--netlist-format requires --netlist OUTPUT; simulation uses its simulator's native format".into());
@@ -192,6 +197,7 @@ fn run() -> Result<(), String> {
     }
     let options = viewer::Options {
         input: inputs.pop(),
+        open_as_text,
         libraries: LibraryPaths::discover(roots),
         smoke_test,
         screenshot,
