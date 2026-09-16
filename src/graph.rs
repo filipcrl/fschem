@@ -11,6 +11,27 @@ use std::{
         mpsc,
     },
 };
+fn graph_nodes(mut text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    loop {
+        text = text.trim_start();
+        if text.is_empty() { break; }
+        if text.starts_with('"') {
+            let mut decoder = serde_json::Deserializer::from_str(text).into_iter::<String>();
+            if let Some(Ok(value)) = decoder.next() {
+                let consumed = decoder.byte_offset();
+                names.push(value);
+                text = &text[consumed..];
+                continue;
+            }
+        }
+        let end = text.find(char::is_whitespace).unwrap_or(text.len());
+        names.push(text[..end].into());
+        text = &text[end..];
+    }
+    names
+}
+
 fn signal_label(native: &str, aliases: &BTreeMap<String, String>) -> String {
     let names: Vec<_> = aliases.iter().filter(|(alias, target)| alias.starts_with('/') && target.as_str() == native).map(|(alias, _)| alias.as_str()).collect();
     if names.is_empty() { native.into() } else { format!("{} ({native})", names.join(", ")) }
@@ -121,7 +142,7 @@ pub(crate) struct Display {
     filter: String,
     expression: String,
     expression_error: Option<String>,
-    calculated: Vec<(String, String)>,
+    calculated: Vec<(usize, String)>,
     mode: Mode,
     log_x: bool,
     fit: bool,
@@ -190,11 +211,14 @@ impl Display {
     }
     fn add_expression(&mut self, expression: &str) -> Result<(), String> {
         let plot = &self.raw.plots[self.plot];
+        if self.calculated.len() >= 64 || self.raw.plots.iter().map(|p|p.points.saturating_mul(p.variables.len())).sum::<usize>().saturating_add(plot.points) > 16_000_000 {
+            return Err("Calculated traces exceed the 64-expression or 16-million-sample limit".into());
+        }
         if plot.variables.iter().any(|v| v.name == expression) {
             return Err("This signal/expression already exists".into());
         }
         let variable = fschem::units::calculate_with_aliases(plot, expression, &self.aliases[self.plot])?;
-        self.calculated.push((plot.name.clone(), expression.into()));
+        self.calculated.push((self.plot, expression.into()));
         Arc::make_mut(&mut self.raw).plots[self.plot].variables.push(variable);
         self.selected.push(true);
         self.dirty = true;
@@ -212,20 +236,20 @@ impl Display {
     }
     /// Keep signal selection and navigation when the underlying file is replaced.
     pub(crate) fn restore_view(&mut self, previous: &Self) {
-        for (name, expression) in &previous.calculated {
-            if let Some(index) = self.raw.plots.iter().position(|p| &p.name == name) {
+        for (index, expression) in &previous.calculated {
+            if *index < self.raw.plots.len() && self.raw.plots[*index].name == previous.raw.plots[*index].name {
+                let index = *index;
                 self.plot = index;
                 self.select_plot();
                 if let Err(error) = self.add_expression(expression) { self.expression_error = Some(error); }
             }
         }
         let old = &previous.raw.plots[previous.plot];
-        self.plot = self
-            .raw
-            .plots
-            .iter()
-            .position(|p| p.name == old.name)
-            .unwrap_or(0);
+        self.plot = if self.raw.plots.get(previous.plot).is_some_and(|p| p.name == old.name) {
+            previous.plot
+        } else {
+            self.raw.plots.iter().position(|p| p.name == old.name).unwrap_or(0)
+        };
         self.select_plot();
         self.mode = previous.mode;
         self.log_x = previous.log_x;
@@ -248,15 +272,48 @@ impl Display {
         self.dirty = true;
     }
 
+    fn restore_calculated(&mut self, props: &fschem::document::Properties) {
+        self.expression_error = None;
+        let mut desired: Vec<(usize,String)> = match props.get("fschem_expressions") {
+            Some(json) if json.len() <= 65536 => match serde_json::from_str(json) {
+                Ok(expressions) => expressions,
+                Err(error) => { self.expression_error = Some(format!("Invalid graph expressions: {error}")); Vec::new() }
+            },
+            Some(_) => {self.expression_error = Some("Graph expressions exceed 64 KiB".into()); Vec::new()},
+            None => Vec::new(),
+        };
+        if desired.len() > 64 {
+            self.expression_error = Some("Graph expressions exceed the 64-expression limit".into());
+            desired.clear();
+        }
+        let parse_error = self.expression_error.take();
+        if desired == self.calculated { self.expression_error = parse_error; return; }
+        if let Some(job) = self.preparing.take() { job.cancelled.store(true, Ordering::Relaxed); }
+        let raw = Arc::make_mut(&mut self.raw);
+        for (index, plot) in raw.plots.iter_mut().enumerate() {
+            plot.variables.retain(|v| !self.calculated.iter().any(|(i,expression)| *i == index && expression == &v.name));
+        }
+        self.calculated.clear();
+        self.traces.clear();
+        self.expression_error = parse_error;
+        for (index, expression) in desired {
+            if index >= self.raw.plots.len() {
+                self.expression_error = Some(format!("Calculated trace dataset {index} is unavailable")); continue;
+            }
+            self.plot = index;
+            self.select_plot();
+            if let Err(error) = self.add_expression(&expression) { self.expression_error = Some(error); }
+        }
+    }
+
     /// Configure a schematic graph using xschem's graph properties.
     pub(crate) fn configure(&mut self, props: &fschem::document::Properties) {
-        self.plot = props.get("dataset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0).min(self.raw.plots.len() - 1);
+        self.restore_calculated(props);
+        let requested = props.get("dataset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        self.plot = requested.min(self.raw.plots.len() - 1);
         self.select_plot();
         if let Some(nodes) = props.get("node") {
-            let names: Vec<_> = nodes
-                .split_whitespace()
-                .map(|s| s.rsplit(';').next().unwrap_or(s))
-                .collect();
+            let names = graph_nodes(nodes);
             let plot = &self.raw.plots[self.plot];
             self.selected = plot
                 .variables
@@ -264,8 +321,10 @@ impl Display {
                 .enumerate()
                 .map(|(i, v)| {
                     Some(i) != plot.scale()
-                        && names.iter().any(|n| {
-                            self.aliases[self.plot].get(*n).is_some_and(|native| native == &v.name)
+                        && names.iter().any(|name| {
+                            if &v.name == name { return true; }
+                            let n = name.rsplit(';').next().unwrap_or(name);
+                            self.aliases[self.plot].get(n).is_some_and(|native| native == &v.name)
                                 || v.name.eq_ignore_ascii_case(n)
                                 || v.name.eq_ignore_ascii_case(&format!("v({n})"))
                         })
@@ -295,6 +354,10 @@ impl Display {
             .zip(props.get("y2").and_then(|s| s.parse::<f64>().ok()))
             .filter(|(a,b)| a.is_finite() && b.is_finite() && a < b);
         self.fit = self.x_range.is_none();
+        if requested >= self.raw.plots.len() {
+            self.selected.fill(false);
+            self.expression_error = Some(format!("Graph dataset {requested} is unavailable"));
+        }
         self.dirty = true;
     }
 
@@ -303,9 +366,12 @@ impl Display {
     /// Only properties owned by waveform controls; unrelated graph fields survive edits.
     pub(crate) fn configuration(&self) -> BTreeMap<String, String> {
         let nodes = self.raw.plots[self.plot].variables.iter().zip(&self.selected)
-            .filter(|(_, selected)| **selected).map(|(v, _)| v.name.as_str()).collect::<Vec<_>>().join(" ");
+            .filter(|(_, selected)| **selected).map(|(v, _)| {
+                if v.name.contains(|c:char| c.is_whitespace() || matches!(c,'"'|'\\')) { serde_json::to_string(&v.name).unwrap() } else { v.name.clone() }
+            }).collect::<Vec<_>>().join(" ");
         BTreeMap::from([
             ("dataset".into(), self.plot.to_string()),
+            ("fschem_expressions".into(), serde_json::to_string(&self.calculated).unwrap()),
             ("node".into(), nodes),
             ("logx".into(), if self.log_x { "1" } else { "0" }.into()),
             ("groupmode".into(), match self.group_mode { GroupMode::Overlay => "overlay", GroupMode::ByUnit => "unit", GroupMode::Separate => "separate" }.into()),
@@ -374,7 +440,8 @@ impl Display {
         let x = range("x1", "x2", fallback(bounds.min()[0], bounds.max()[0]));
         let y = range("y1", "y2", fallback(bounds.min()[1], bounds.max()[1]));
         draw_grid(&painter, area, x, y);
-        draw_y_axis(&painter, area, y, "");
+        let units: std::collections::BTreeSet<_> = self.selected.iter().enumerate().filter(|(_,s)|**s).map(|(i,_)|self.trace_unit(i)).collect();
+        draw_y_axis(&painter, area, y, if units.len()==1 { units.into_iter().next().unwrap() } else { "" });
         let plot = &self.raw.plots[self.plot];
         let x_unit = plot
             .scale()
@@ -398,10 +465,29 @@ impl Display {
                 labels.push(trace.label.clone());
             }
         }
+        if !ui.input(|i| i.pointer.any_down()) && ui.rect_contains_pointer(area.intersect(ui.clip_rect()))
+            && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
+            && let Some((trace, point, screen)) = self.closest_embedded(pointer, area, x, y)
+        {
+            painter.circle_filled(screen, 4.5, Color32::BLACK);
+            painter.circle_filled(screen, 3.2, trace_color(trace.index));
+            painter.circle_stroke(screen, 4.5, Stroke::new(1., Color32::WHITE));
+            let x_value = if self.log_x { 10_f64.powf(point.x) } else { point.x };
+            let text = format!("{}\nx = {}\ny = {}", trace.label, si_value(x_value, x_unit), si_value(point.y, self.trace_unit(trace.index)));
+            // Pure hover: no click/drag sense is allocated, so schematic tools
+            // retain ownership. Distinct embedded displays cannot reuse state.
+            let id = ui.id().with(("embedded-waveform-marker", self as *const Self as usize));
+            egui::Area::new(id).order(egui::Order::Tooltip).fixed_pos(screen + Vec2::new(10.,10.))
+                .interactable(false).show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {ui.label(egui::RichText::new(text).monospace());});
+                });
+        }
         painter.text(
             rect.left_top() + Vec2::new(6., 3.),
             egui::Align2::LEFT_TOP,
-            if labels.is_empty() {
+            if let Some(error) = &self.expression_error {
+                error.clone()
+            } else if labels.is_empty() {
                 "No matching signals".into()
             } else {
                 labels.join("   ")
@@ -924,6 +1010,12 @@ impl Display {
         } else {
             (min, max)
         }
+    }
+    fn closest_embedded(&self, pointer: Pos2, area: Rect, x: (f64,f64), y: (f64,f64)) -> Option<(&Trace,PlotPoint,Pos2)> {
+        if !area.contains(pointer) { return None; }
+        self.traces.iter().filter(|(i,_)| self.selected[**i]).filter_map(|(_,trace)| {
+            closest_point_on_rendered_trace(trace,pointer,area,x,y).map(|(point,screen,distance)|(trace,point,screen,distance))
+        }).min_by(|a,b| a.3.total_cmp(&b.3)).filter(|hit|hit.3<=18.).map(|(trace,point,screen,_)|(trace,point,screen))
     }
     fn closest_trace<'a>(
         &'a self,
@@ -1574,6 +1666,73 @@ mod tests {
         assert_eq!(signal_label("v(top.out)", &display.aliases[0]), "v(top.out)");
         assert_eq!(display.raw.plots[0].variables[0].name, "v(top:out)");
         assert!(display.open_plot(5).is_err());
+    }
+
+    #[test]
+    fn calculated_graph_configuration_roundtrips_and_removes_on_undo() {
+        let bytes = b"Title: test\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 3\nNo. Points: 2\nVariables:\n0 time time\n1 v(out) voltage\n2 i(v1) current\nValues:\n0 0\n2\n.001\n1 1\n4\n.002\n";
+        let mut display = Display::new("test.raw".into(),RawFile::parse(bytes).unwrap());
+        display.selected.fill(false);
+        display.add_expression("v(out) / i(v1)").unwrap();
+        display.group_mode = GroupMode::Separate;
+        let configuration = display.configuration();
+        let props = fschem::document::Properties::parse(configuration.iter().map(|(k,v)|format!("{k}={}",serde_json::to_string(v).unwrap())).collect::<Vec<_>>().join(" "));
+        let mut reopened = Display::new("test.raw".into(),RawFile::parse(bytes).unwrap());
+        reopened.configure(&props);
+        assert_eq!(reopened.selected,vec![false,false,false,true]);
+        assert_eq!(reopened.raw.plots[0].variables[3].unit,"Ω");
+        assert_eq!(reopened.group_mode,GroupMode::Separate);
+        assert_eq!(reopened.configuration(),configuration);
+        let original = fschem::document::Properties::parse("node=out".into());
+        reopened.configure(&original);
+        assert_eq!(reopened.raw.plots[0].variables.len(),3);
+        assert_eq!(reopened.selected,vec![false,true,false]);
+        assert!(reopened.calculated.is_empty());
+        reopened.configure(&props);
+        assert_eq!(reopened.selected,vec![false,false,false,true]);
+        reopened.configure(&fschem::document::Properties::parse("dataset=99 node=out".into()));
+        assert!(reopened.selected.iter().all(|s| !s));
+        assert!(reopened.expression_error.as_ref().unwrap().contains("unavailable"));
+    }
+
+    #[test]
+    fn embedded_hover_readout_paints_units_and_is_suppressed_during_drag() {
+        let raw = RawFile::parse(b"Title: test\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 2\nNo. Points: 2\nVariables:\n0 time time\n1 v(out) voltage\nValues:\n0 0\n2\n1 1\n4\n").unwrap();
+        let mut display = Display::new("test.raw".into(),raw);
+        let ctx = egui::Context::default();
+        let props = fschem::document::Properties::parse("node=out x1=0 x2=1 y1=0 y2=5 groupmode=separate".into());
+        display.configure(&props);
+        let pointer = Pos2::new(222.,100.8);
+        let mut painted = false;
+        for _ in 0..3 {
+            let output = ctx.run(egui::RawInput { screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(800.,600.))), events:vec![egui::Event::PointerMoved(pointer)], ..Default::default() },|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui|display.paint_embedded(ui,Rect::from_min_size(Pos2::ZERO,Vec2::new(400.,250.)),&props));
+            });
+            painted |= output.shapes.iter().any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text.contains("x = 500ms") && t.galley.job.text.contains("y = 3V")));
+        }
+        assert!(painted,"embedded readout must contain time/voltage units");
+        let output = ctx.run(egui::RawInput { events:vec![egui::Event::PointerButton {pos:pointer,button:egui::PointerButton::Primary,pressed:true,modifiers:Default::default()}], ..Default::default() },|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui|display.paint_embedded(ui,Rect::from_min_size(Pos2::ZERO,Vec2::new(400.,250.)),&props));
+        });
+        assert!(!output.shapes.iter().any(|s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text.contains("x = "))));
+    }
+
+    #[test]
+    fn embedded_hover_marker_uses_panel_bounds_and_selected_trace() {
+        let raw = RawFile::parse(b"Title: test\nPlotname: Transient Analysis\nFlags: real\nNo. Variables: 2\nNo. Points: 2\nVariables:\n0 time time\n1 v(out) voltage\nValues:\n0 0\n2\n1 1\n4\n").unwrap();
+        let mut display = Display::new("test.raw".into(),raw);
+        display.traces.get_mut(&1).unwrap().series.prepare(View {min:0.,max:1.,columns:100});
+        let area = Rect::from_min_max(Pos2::new(20.,40.),Pos2::new(220.,140.));
+        let pointer = point_to_screen(PlotPoint::new(0.5,3.),area,(0.,1.),(0.,5.));
+        let (trace,point,screen) = display.closest_embedded(pointer,area,(0.,1.),(0.,5.)).unwrap();
+        assert_eq!(trace.index,1);
+        assert!((point.x-0.5).abs()<1e-6 && (point.y-3.).abs()<1e-6);
+        assert!(screen.distance(pointer)<1e-3);
+        assert_eq!(display.trace_unit(trace.index),"V");
+        assert!(display.closest_embedded(Pos2::new(120.,42.),area,(0.,1.),(0.,5.)).is_none());
+        assert!(display.closest_embedded(Pos2::new(120.,141.),area,(0.,1.),(0.,5.)).is_none());
+        display.selected[1]=false;
+        assert!(display.closest_embedded(pointer,area,(0.,1.),(0.,5.)).is_none());
     }
 
     #[test]

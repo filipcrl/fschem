@@ -53,6 +53,29 @@ fn success(output: &Output) {
 }
 
 #[test]
+fn project_configuration_loads_libraries_and_scoped_pdk_without_exports() {
+    let dir = Workspace::new();
+    fs::create_dir_all(dir.0.join("lib/mock")).unwrap();
+    fs::create_dir_all(dir.0.join("override")).unwrap();
+    fs::create_dir_all(dir.0.join("schem")).unwrap();
+    let symbol = "v {xschem file_version=1.3}\nK {type=resistor format=\"@name @pinlist @value\" template=\"name=R value=3k\"}\nB 5 -2 -2 2 2 {name=P dir=inout pinnumber=1}\nB 5 98 -2 102 2 {name=N dir=inout pinnumber=2}\n";
+    fs::write(dir.0.join("lib/mock/configured.sym"),symbol).unwrap();
+    fs::write(dir.0.join("override/configured.sym"),symbol.replace("3k","9k")).unwrap();
+    fs::write(dir.0.join(".fschem.toml"),"pdk_root='lib'\npdk='mock'\nlibrary_paths=['$PDK_ROOT/$PDK']\nsimulator='vacask'\n").unwrap();
+    fs::write(dir.0.join("schem/config.sch"),"v {xschem file_version=1.3}\nC {$env(PDK_ROOT)/$env(PDK)/configured.sym} 0 0 0 0 {name=R1}\nC {configured.sym} 0 100 0 0 {name=R2}\n").unwrap();
+    let output=dir.command().env_remove("PDK_ROOT").env_remove("PDK").args(["-L","override","--netlist","configured.spice","schem/config.sch"]).output().unwrap();
+    success(&output);
+    let deck=fs::read_to_string(dir.0.join("configured.spice")).unwrap();
+    assert!(deck.lines().any(|s|s.starts_with("R1 ")&&s.ends_with("3k")),"{deck}");
+    assert!(deck.lines().any(|s|s.starts_with("R2 ")&&s.ends_with("9k")),"{deck}");
+    assert!(!dir.command().env_remove("PDK_ROOT").env_remove("PDK").args(["--no-config","--netlist","missing.spice","schem/config.sch"]).output().unwrap().status.success());
+    fs::write(dir.0.join(".fschem.toml"),"unknown_key=true").unwrap();
+    assert!(!dir.run(&["--check","schem/config.sch"]).status.success());
+    success(&dir.run(&["--no-config","--check","schem/config.sch"]));
+    assert!(!dir.run(&["--config",".fschem.toml","--no-config","--check","schem/config.sch"]).status.success());
+}
+
+#[test]
 fn exports_both_formats_without_a_window() {
     let dir = Workspace::new();
     success(&dir.run(&["--netlist", "default.spice", "spice.sch"]));

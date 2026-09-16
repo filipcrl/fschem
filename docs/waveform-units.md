@@ -30,6 +30,9 @@ Nested derivatives are unsupported. `deriv` uses endpoint/central secants over
 the plot axis. Zero denominators/nonfinite inputs yield nonfinite samples,
 rendered as gaps. This is not a symbolic mathematics or general SPICE evaluator.
 Calculated vectors are in-memory additions; the original raw file is unchanged.
+When the window is linked to a schematic graph, its declarative expressions are
+saved with the graph configuration and recalculated on reopening. At most 64
+expressions and 16 million total raw/calculated samples are accepted per display.
 
 Python exposes the same evaluator and type model:
 

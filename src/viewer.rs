@@ -2689,7 +2689,7 @@ fn graph_properties_ui(
         ui.weak(format!("{} graphs · edits apply to all selected graphs", graphs.len()));
     }
     ui.weak("Raw file: absolute path or relative to the schematic. Leave empty to use the schematic's .raw file.");
-    let mut keys: BTreeSet<String> = ["rawfile", "node", "dataset", "x1", "x2", "y1", "y2", "logx", "groupmode", "mode"]
+    let mut keys: BTreeSet<String> = ["rawfile", "node", "dataset", "x1", "x2", "y1", "y2", "logx", "groupmode", "mode", "fschem_expressions"]
         .into_iter().map(str::to_owned).collect();
     for props in graphs {
         keys.extend(props.entries.iter().map(|(key, _)| key.clone()));

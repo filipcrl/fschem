@@ -539,6 +539,9 @@ scoped PDK variables and the default simulator. See [project configuration](docs
 Long expanded schematic fields are [elided for display only](docs/field-display.md).
 Waveform results preserve native type metadata and show electrical units;
 [calculated traces](docs/waveform-units.md) propagate units such as V/V, Ω and W.
+Press **E** on a [schematic graph](docs/linked-graphs.md) for its linked waveform
+window; selections/layout synchronize both ways, including stacked panels. Embedded
+graphs also show nearest-trace hover markers with unit-aware readouts.
 
 ## Python experiments and artifact inspection
 

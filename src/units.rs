@@ -13,11 +13,11 @@ impl Unit {
             "current" | "a" => (Some([0, 1, 0]), "A"),
             "time" | "s" => (Some([0, 0, 1]), "s"),
             "frequency" | "hz" => (Some([0, 0, -1]), "Hz"),
-            "resistance" | "ohm" | "ω" => (Some([1, -1, 0]), "Ω"),
+            "resistance" | "ohm" | "ω" | "Ω" | "v/a" => (Some([1, -1, 0]), "Ω"),
             "conductance" | "siemens" => (Some([-1, 1, 0]), "S"),
             "capacitance" | "f" => (Some([-1, 1, 1]), "F"),
             "inductance" | "h" => (Some([1, -1, 1]), "H"),
-            "power" | "w" => (Some([1, 1, 0]), "W"),
+            "power" | "w" | "v*a" | "v·a" => (Some([1, 1, 0]), "W"),
             "charge" | "c" => (Some([0, 1, 1]), "C"),
             "1" | "dimensionless" => (Some([0, 0, 0]), "1"),
             "v/v" => (Some([0, 0, 0]), "V/V"),
@@ -42,6 +42,9 @@ impl Unit {
         result
     }
     fn dimensions(d: [i32; 3]) -> Self {
+        if d.iter().any(|n| !(-64..=64).contains(n)) {
+            return Self { dimensions: None, label: "?".into() };
+        }
         let known = match d {
             [1, 0, 0] => "V",
             [0, 1, 0] => "A",
@@ -464,6 +467,8 @@ mod tests {
     use super::*;
     #[test]
     fn electrical_ratios_and_products() {
+        assert_eq!(Unit::parse("unit:-2147483648,0,0").label, "?");
+        assert_eq!(Unit::parse("unit:2147483647,0,0").label, "?");
         let v = Unit::parse("voltage");
         let a = Unit::parse("current");
         assert_eq!(v.product(&v, true).label, "V/V");
