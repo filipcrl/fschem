@@ -5,6 +5,7 @@ mod graph;
 mod macos_menu;
 mod schematic_graphs;
 mod viewer;
+mod text_viewer;
 mod waveform_lod;
 mod waveforms;
 

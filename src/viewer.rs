@@ -684,6 +684,7 @@ struct ExportCompletion {
 }
 #[derive(Default)]
 struct DocumentTab {
+    text: Option<crate::text_viewer::TextDocument>,
     current: Option<DocumentView>,
     stack: Vec<DocumentView>,
 }
@@ -853,6 +854,8 @@ enum Action {
     Save,
     SaveAs,
     OpenDialog,
+    OpenTextDialog,
+    OpenText(PathBuf),
     CloseTab,
     Demo,
     Reload,
@@ -867,6 +870,7 @@ enum Action {
 pub struct Viewer {
     #[cfg(target_os = "macos")]
     native_menu: Option<crate::macos_menu::NativeMenu>,
+    text: Option<crate::text_viewer::TextDocument>,
     current: Option<DocumentView>,
     /// Active tab state; inactive tabs are parked in `tabs`.
     navigation_stack: Vec<DocumentView>,
@@ -907,6 +911,7 @@ impl Viewer {
         let mut viewer = Self {
             #[cfg(target_os = "macos")]
             native_menu: None,
+            text: None,
             current: None,
             navigation_stack: Vec::new(),
             tabs: vec![DocumentTab::default()],
@@ -940,7 +945,7 @@ impl Viewer {
             last_file_check: Instant::now(),
         };
         if let Some(path) = options.input {
-            viewer.load(ctx, Some(path), false);
+            viewer.action(ctx, Action::Open(path));
         } else if viewer.smoke || viewer.screenshot.is_some() {
             viewer.load(ctx, None, false);
         }
@@ -991,6 +996,7 @@ impl Viewer {
 
     fn park_tab(&mut self) {
         self.tabs[self.active_tab] = DocumentTab {
+            text: self.text.take(),
             current: self.current.take(),
             stack: std::mem::take(&mut self.navigation_stack),
         };
@@ -1007,6 +1013,7 @@ impl Viewer {
         self.park_tab();
         self.active_tab = index;
         let tab = std::mem::take(&mut self.tabs[index]);
+        self.text = tab.text;
         self.current = tab.current;
         self.navigation_stack = tab.stack;
         self.pointer = None;
@@ -1047,6 +1054,7 @@ impl Viewer {
         self.request += 1;
         self.loading = None;
         self.current = None;
+        self.text = None;
         self.navigation_stack.clear();
         self.tabs.remove(index);
         if self.tabs.is_empty() {
@@ -1054,6 +1062,7 @@ impl Viewer {
         }
         self.active_tab = index.min(self.tabs.len() - 1);
         let tab = std::mem::take(&mut self.tabs[self.active_tab]);
+        self.text = tab.text;
         self.current = tab.current;
         self.navigation_stack = tab.stack;
     }
@@ -1141,7 +1150,7 @@ impl Viewer {
                     view.target = completion.target;
                     let name = view.name();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("{name} — fschem")));
-                    if self.opening_tab && self.current.is_some() {
+                    if self.opening_tab && (self.current.is_some() || self.text.is_some()) {
                         self.park_tab();
                         self.tabs.push(DocumentTab::default());
                         self.active_tab = self.tabs.len() - 1;
@@ -1250,6 +1259,15 @@ impl Viewer {
         self.current.as_ref()?.history.redo_label()
     }
     fn action(&mut self, ctx: &egui::Context, action: Action) {
+        if self.text.is_some() {
+            if matches!(action, Action::Reload) {
+                self.text.as_mut().unwrap().reload(ctx);
+                return;
+            }
+            if !matches!(action, Action::Open(_) | Action::OpenText(_) | Action::OpenTextDialog | Action::OpenDialog | Action::CloseTab | Action::Demo | Action::OpenRaw) {
+                return;
+            }
+        }
         if (matches!(action, Action::Back) && !self.navigation_stack.is_empty()
             || matches!(action, Action::Reload))
             && !self.confirm_active(false)
@@ -1374,6 +1392,22 @@ impl Viewer {
                     }
                 }
             }
+            Action::OpenText(path) => {
+                self.request += 1;
+                self.loading = None;
+                self.opening_tab = false;
+                if self.current.is_some() || self.text.is_some() {
+                    self.park_tab();
+                    self.tabs.push(DocumentTab::default());
+                    self.active_tab = self.tabs.len() - 1;
+                }
+                self.text = Some(crate::text_viewer::TextDocument::new(ctx, path));
+            }
+            Action::OpenTextDialog => {
+                if let Some(path) = rfd::FileDialog::new().set_title("Open as read-only text").pick_file() {
+                    self.action(ctx, Action::OpenText(path));
+                }
+            }
             Action::Open(path) => {
                 if path
                     .extension()
@@ -1381,14 +1415,18 @@ impl Viewer {
                 {
                     self.waveforms.load(ctx, path);
                 } else {
-                    self.open_tab(ctx, Some(path));
+                    if crate::text_viewer::is_text(&path) {
+                        self.action(ctx, Action::OpenText(path));
+                    } else {
+                        self.open_tab(ctx, Some(path));
+                    }
                 }
             }
             Action::CloseTab => self.close_tab(self.active_tab),
             Action::OpenRaw => self.waveforms.open_dialog(ctx),
             Action::OpenDialog => {
                 let mut dialog = rfd::FileDialog::new()
-                    .add_filter("Xschem schematic or symbol", &["sch", "sym"]);
+                    .add_filter("Schematic or text", &["sch", "sym", "py", "spice", "sim", "log", "lib", "va", "json", "toml", "txt", "raw"]);
                 if let Some(dir) = self
                     .current
                     .as_ref()
@@ -1398,7 +1436,7 @@ impl Viewer {
                     dialog = dialog.set_directory(dir);
                 }
                 if let Some(path) = dialog.pick_file() {
-                    self.open_tab(ctx, Some(path));
+                    self.action(ctx, Action::Open(path));
                 }
             }
             Action::Demo => self.open_tab(ctx, None),
@@ -1552,6 +1590,7 @@ impl Viewer {
             for command in menu.commands() {
                 match command {
                     Command::Open => actions.push(Action::OpenDialog),
+                    Command::OpenText => actions.push(Action::OpenTextDialog),
                     Command::CloseTab => actions.push(Action::CloseTab),
                     Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     Command::Undo => actions.push(Action::Undo),
@@ -1842,6 +1881,7 @@ impl Viewer {
         });
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                if ui.button("Open as text…").clicked() { actions.push(Action::OpenTextDialog); }
                 if ui.button("Open…").clicked() {
                     actions.push(Action::OpenDialog);
                 }
@@ -1916,7 +1956,8 @@ impl Viewer {
                     ui.horizontal(|ui| {
                         for (index, tab) in self.tabs.iter().enumerate() {
                             let active = index == self.active_tab;
-                            let names = if active {
+                            let text = if active { self.text.as_ref() } else { tab.text.as_ref() };
+                            let names = if let Some(text) = text { vec![text.name()] } else if active {
                                 tab_names(&self.navigation_stack, self.current.as_ref())
                             } else {
                                 tab_names(&tab.stack, tab.current.as_ref())
@@ -1938,7 +1979,7 @@ impl Viewer {
         if let Some(index) = close {
             self.close_tab(index);
         }
-        let title = tab_label(&self.navigation_stack, self.current.as_ref());
+        let title = self.text.as_ref().map(|t| t.name()).unwrap_or_else(|| tab_label(&self.navigation_stack, self.current.as_ref()));
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(if title.is_empty() {
             "fschem".into()
         } else {
@@ -2117,7 +2158,9 @@ impl Viewer {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::BLACK))
             .show(ctx, |ui| {
-                if let Some(current) = &mut self.current {
+                if let Some(text) = &mut self.text {
+                    text.ui(ui);
+                } else if let Some(current) = &mut self.current {
                     let (_, rect) = ui.allocate_space(ui.available_size());
                     let response = ui.interact(rect, canvas_id(), egui::Sense::click_and_drag());
                     let size = Point::new(rect.width() as f64, rect.height() as f64);
@@ -2342,6 +2385,9 @@ impl Viewer {
             .default_size([800., 550.])
             .show(ctx, |ui| {
                 if let Some(current) = &self.current {
+                    if let Some(path) = &current.loaded.path {
+                        if ui.button("Open disk source in text tab").clicked() { actions.push(Action::OpenText(path.clone())); }
+                    }
                     let text = preview(current.loaded.document.original(), 100_000);
                     let mut text = text.as_str();
                     egui::ScrollArea::both().show(ui, |ui| {
@@ -3519,6 +3565,7 @@ mod tests {
         let label = tab_label(&viewer.navigation_stack, viewer.current.as_ref());
         assert!(label.ends_with('*'));
         viewer.tabs.push(DocumentTab {
+            text: None,
             current: Some(selection_view()),
             stack: Vec::new(),
         });
