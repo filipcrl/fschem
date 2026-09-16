@@ -1911,6 +1911,14 @@ impl Viewer {
                 if ui.button("Open raw…").on_hover_text("Plot simulation raw data in a separate waveform window").clicked() {
                     actions.push(Action::OpenRaw);
                 }
+                egui::ComboBox::from_id_salt("run-simulator")
+                    .selected_text(self.simulator.name())
+                    .width(95.)
+                    .show_ui(ui, |ui| {
+                        for simulator in fschem::simulation::Simulator::ALL {
+                            ui.selectable_value(&mut self.simulator, simulator, simulator.name());
+                        }
+                    });
                 if ui.add_enabled(self.can_export(), egui::Button::new("▶"))
                     .on_hover_text(format!("Run {} — generate a netlist and save raw results and log", self.simulator.name()))
                     .clicked() {

@@ -780,6 +780,17 @@ fn bezier_points(points: &[Point]) -> Vec<Point> {
     result
 }
 
+/// Canvas-only field limit; original document/property values remain lossless.
+pub const DEFAULT_FIELD_MAX_CHARS: usize = 48;
+fn elide_field(value: &str, limit: usize) -> String {
+    if limit == 0 || value.chars().count() <= limit {
+        return value.into();
+    }
+    // The schematic stroke font is ASCII: three dots render reliably at any zoom.
+    let dots = limit.min(3);
+    value.chars().take(limit - dots).chain(std::iter::repeat_n('.', dots)).collect()
+}
+
 fn expand_label(text: &str, context: Option<&LabelContext<'_>>) -> (String, bool) {
     if text.contains("tcleval(") {
         return ("[Tcl expression]".into(), true);
@@ -816,7 +827,11 @@ fn expand_label(text: &str, context: Option<&LabelContext<'_>>) -> (String, bool
             .or_else(|| context.template.get(&key))
             .or(pin_value);
         if let Some(value) = value {
-            result.push_str(value);
+            let limit = context.instance.get("display_max_chars")
+                .or_else(|| context.template.get("display_max_chars"))
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_FIELD_MAX_CHARS);
+            result.push_str(&elide_field(value, limit));
         } else if key == "symname" {
             result.push_str(
                 &Path::new(context.symbol)
@@ -889,6 +904,20 @@ pub fn junction_points(wires: &[(Point, Point)]) -> Vec<Point> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_elision_is_unicode_safe_and_display_only() {
+        assert_eq!(elide_field("abc", 3), "abc");
+        assert_eq!(elide_field("abcdef", 5), "ab...");
+        assert_eq!(elide_field("αβγδεζ", 5), "αβ...");
+        assert_eq!(elide_field("abcdef", 2), "..");
+        assert_eq!(elide_field("abcdef", 0), "abcdef");
+        let original = format!("v {{xschem file_version=1.3}}\nC {{a.sym}} 0 0 0 0 {{name=V1 value=\"{}\" display_max_chars=12}}\n[\nK {{template=\"name=V value=0\"}}\nT {{@value}} 0 0 0 0 .2 .2 {{}}\n]\n", "x".repeat(80));
+        let document = Arc::new(Document::parse(original.clone()).unwrap());
+        let loaded = LoadedDocument::from_document(document, None, LibraryPaths::default()).unwrap();
+        assert_eq!(loaded.document.original(), original);
+        assert!(loaded.scene.items.iter().any(|item| matches!(&item.shape, Shape::Text(run) if run.text == "xxxxxxxxx...")));
+    }
     #[test]
     fn t_junction_is_connected_but_crossing_is_not() {
         let horizontal = (Point::new(-10., 0.), Point::new(10., 0.));

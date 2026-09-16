@@ -467,6 +467,7 @@ impl Compiler {
                 "lab",
                 "hide",
                 "hide_texts",
+                "display_max_chars",
                 "highlight",
                 "format",
                 "spectre_format",
