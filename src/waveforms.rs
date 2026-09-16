@@ -86,6 +86,7 @@ struct WindowState {
     loading: Option<mpsc::Receiver<Result<Display, String>>>,
     error: Option<String>,
     watched: Option<PathBuf>,
+    selected_plot: Option<usize>,
     stamp: Option<(std::time::SystemTime, u64)>,
     checked: Option<std::time::Instant>,
 }
@@ -106,6 +107,11 @@ impl WindowState {
         self.load_selected(ctx, path, None);
     }
     fn load_selected(&mut self, ctx: &egui::Context, path: PathBuf, plot: Option<usize>) {
+        self.selected_plot = plot;
+        if plot.is_some() {
+            // Never retain a different result behind a failed explicit selection.
+            self.data = None;
+        }
         self.watched = Some(path.clone());
         self.stamp = file_stamp(&path);
         self.checked = Some(std::time::Instant::now());
@@ -132,7 +138,8 @@ impl WindowState {
             self.loading = None;
             match result {
                 Ok(mut data) => {
-                    if let Some(previous) = &self.data
+                    if self.selected_plot.is_none()
+                        && let Some(previous) = &self.data
                         && previous.path == data.path
                     {
                         data.restore_view(previous);
@@ -156,7 +163,7 @@ impl WindowState {
             if let Some(path) = self.watched.clone() {
                 let next = file_stamp(&path);
                 if next.is_some() && (next != self.stamp || self.error.is_some()) {
-                    self.load(ui.ctx(), path);
+                    self.load_selected(ui.ctx(), path, self.selected_plot);
                 } else if next.is_none() {
                     self.stamp = None;
                 }
@@ -174,7 +181,7 @@ impl WindowState {
                 .clicked()
             {
                 let path = self.data.as_ref().unwrap().path.clone();
-                self.load(ui.ctx(), path);
+                self.load_selected(ui.ctx(), path, self.selected_plot);
             }
             if self.loading.is_some() {
                 ui.spinner();
@@ -195,6 +202,32 @@ impl WindowState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_invalid_plot_stays_unavailable_across_retry() {
+        let path = std::env::temp_dir().join(format!("fschem-plot-selection-{}.raw", std::process::id()));
+        std::fs::write(&path, b"Title: divider\nPlotname: Operating Point\nFlags: real\nNo. Variables: 1\nNo. Points: 1\nVariables:\n0 v(out) voltage\nValues:\n0 2\n").unwrap();
+        let ctx = egui::Context::default();
+        let mut state = WindowState::default();
+        state.load_selected(&ctx, path.clone(), Some(5));
+        for _ in 0..2 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while state.loading.is_some() {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                state.poll();
+            }
+            assert!(state.error.is_some());
+            assert!(state.data.is_none());
+            assert_eq!(state.selected_plot, Some(5));
+            state.checked = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| state.contents(ui));
+            });
+            assert!(state.loading.is_some());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn waveform_window_renders_in_embedded_viewports() {
         let raw = RawFile::parse(b"Title: divider\nPlotname: Operating Point\nFlags: real\nNo. Variables: 2\nNo. Points: 1\nVariables:\n0 v(out) voltage\n1 i(v1) current\nValues:\n0 2\n-1e-4\n").unwrap();

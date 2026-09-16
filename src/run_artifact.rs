@@ -44,6 +44,9 @@ impl RunArtifact {
         let path = path
             .canonicalize()
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        if !std::fs::metadata(&path).map_err(|e| e.to_string())?.is_file() {
+            return Err("run manifest must be a regular file".into());
+        }
         let root = path.parent().ok_or("manifest has no parent")?.to_owned();
         // Bound manifest memory, including malicious/unintentionally huge JSON.
         use std::io::Read;
@@ -166,6 +169,18 @@ pub fn contained(root: &Path, relative: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn rejects_fifo_manifest_without_waiting_for_writer() {
+        let root = std::env::temp_dir().join(format!("fschem-fifo-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("run.json");
+        assert!(std::process::Command::new("mkfifo").arg(&path).status().unwrap().success());
+        assert!(RunArtifact::open(&root).unwrap_err().contains("regular file"));
+        assert!(RunArtifact::open(&path).unwrap_err().contains("regular file"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn validates_manifest_and_partial_files() {
         let root = std::env::temp_dir().join(format!("fschem-run-view-{}", std::process::id()));
