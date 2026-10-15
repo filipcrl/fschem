@@ -20,6 +20,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+#[path = "instance_picker.rs"]
+mod instance_picker;
+use instance_picker::InstancePicker;
+
 const DEMO: &str = include_str!("../examples/demo.sch");
 const DEFAULT_GRID_SPACING: f64 = 10.;
 const MIN_GRID_SPACING: f64 = 0.001;
@@ -87,6 +91,7 @@ struct MoveState {
     restore: Arc<LoadedDocument>,
     selection_before: BTreeSet<Selection>,
     copying: bool,
+    inserting: bool,
     records: BTreeSet<usize>,
     pivot: Point,
     grab: Point,
@@ -192,6 +197,7 @@ impl DocumentView {
             restore: Arc::clone(&self.loaded),
             selection_before: self.selected.clone(),
             copying: false,
+            inserting: false,
             records,
             pivot,
             grab: pointer,
@@ -299,6 +305,22 @@ impl DocumentView {
         }
         self.cache = PaintCache::new(&loaded.scene);
         self.loaded = Arc::new(loaded);
+        Ok(())
+    }
+    fn begin_instance(&mut self, path: &Path, paths: &LibraryPaths) -> Result<(), String> {
+        let symbol = fschem::library::read_document(path)?;
+        let template = symbol.symbol_properties().and_then(|p| p.get("template")).unwrap_or("");
+        let (document, index) = self.loaded.document.with_instance(&path.to_string_lossy(), template)?;
+        let restore = self.loaded.clone();
+        let selection_before = self.selected.clone();
+        self.install_document(document, paths)?;
+        self.select_records(&BTreeSet::from([index]));
+        self.begin_move(Point::default());
+        if let Some(moving) = &mut self.moving {
+            moving.restore = restore;
+            moving.selection_before = selection_before;
+            moving.inserting = true;
+        }
         Ok(())
     }
     fn begin_copy(&mut self, pointer: Point, paths: &LibraryPaths) -> Result<(), String> {
@@ -529,7 +551,9 @@ impl DocumentView {
             rotation: moving.rotation,
             flip: moving.flip,
         };
-        let operation = if moving.copying {
+        let operation = if moving.inserting {
+            EditOperation::Insert(self.edit_state())
+        } else if moving.copying {
             EditOperation::Copy(placement)
         } else {
             EditOperation::Move(placement)
@@ -938,6 +962,7 @@ pub struct Viewer {
     grid_spacing: f64,
     show_hidden: bool,
     show_libraries: bool,
+    instance_picker: Option<InstancePicker>,
     show_source: bool,
     show_diagnostics: bool,
     show_fps: bool,
@@ -982,6 +1007,7 @@ impl Viewer {
             grid_spacing: DEFAULT_GRID_SPACING,
             show_hidden: false,
             show_libraries: false,
+            instance_picker: None,
             show_source: false,
             show_diagnostics: false,
             show_fps: false,
@@ -1770,7 +1796,12 @@ impl Viewer {
                 actions.push(Action::Reload);
             }
         });
-        if !ctx.wants_keyboard_input() || ctx.memory(|memory| memory.has_focus(canvas_id())) {
+        if self.instance_picker.is_none() && (!ctx.wants_keyboard_input() || ctx.memory(|memory| memory.has_focus(canvas_id()))) {
+            if ctx.input(|i| i.modifiers == egui::Modifiers::SHIFT && i.key_pressed(Key::I))
+                && self.current.as_ref().is_some_and(|v| v.moving.is_none() && v.wiring.is_none())
+            {
+                self.instance_picker = Some(InstancePicker::new(&self.paths));
+            }
             ctx.input(|input| {
                 if !input.modifiers.any()
                     && (input.key_pressed(Key::F) || input.key_pressed(Key::Home))
@@ -2332,7 +2363,7 @@ impl Viewer {
                     };
                     self.pointer = response.hover_pos().map(|pos| canvas.world(pos));
                     if self.pointer.is_some() { self.last_pointer = self.pointer; }
-                    let keyboard = !ctx.wants_keyboard_input() || response.has_focus();
+                    let keyboard = self.instance_picker.is_none() && (!ctx.wants_keyboard_input() || response.has_focus());
                     let keys = ui.input(|input| {
                         if keyboard && input.modifiers == egui::Modifiers::NONE {
                             input.events.iter().filter_map(|event| match event {
@@ -2472,6 +2503,16 @@ impl Viewer {
         self.automation(ctx);
     }
     fn windows(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        if let Some(picker) = &mut self.instance_picker {
+            let (closed, chosen) = picker.show(ctx);
+            if closed || chosen.is_some() { self.instance_picker = None; }
+            if let Some(path) = chosen {
+                ctx.memory_mut(|m| m.request_focus(canvas_id()));
+                if let Some(view) = &mut self.current {
+                    if let Err(error) = view.begin_instance(&path, &self.paths) { self.error = Some(error); }
+                }
+            }
+        }
         let mut keep_run = true;
         if let Some(run) = &self.run_view {
             egui::Window::new("Run artifacts (read only)").open(&mut keep_run).default_size([650., 500.]).show(ctx, |ui| {
@@ -2905,6 +2946,31 @@ mod tests {
         viewer.current.as_mut().unwrap().undo(&viewer.paths).unwrap();
         viewer.sync_linked_graph(&ctx);
         assert!(viewer.waveforms.test_link(None).is_none(), "deletion detaches until explicit E");
+    }
+
+    #[test]
+    fn library_instance_placement_cancels_and_undoes() {
+        let paths = LibraryPaths::default();
+        let path = std::env::temp_dir().join(format!("fschem-picker-{}.sym", session_id()));
+        std::fs::write(&path, "v {xschem file_version=1.3}\nK {template=\"name=R1 value=1k\"}\nL 4 -10 0 10 0 {}\n").unwrap();
+        let mut view = selection_view();
+        let original = view.loaded.document.original().to_owned();
+        view.begin_instance(&path, &paths).unwrap();
+        view.cancel_move();
+        assert_eq!(view.loaded.document.original(), original);
+        view.begin_instance(&path, &paths).unwrap();
+        view.update_move(Some(Point::new(40., 60.)), &[], 10., &paths).unwrap();
+        view.commit_move(&paths).unwrap();
+        let placed = view.loaded.document.original().to_owned();
+        assert!(placed.contains("40 60 0 0"));
+        assert!(view.loaded.document.records.iter().any(|r| matches!(&r.kind,
+            RecordKind::Instance { properties, .. } if properties.get("value") == Some("1k"))));
+        assert_eq!(view.history.undo_label(), Some("Place instance"));
+        view.undo(&paths).unwrap();
+        assert_eq!(view.loaded.document.original(), original);
+        view.redo(&paths).unwrap();
+        assert_eq!(view.loaded.document.original(), placed);
+        std::fs::remove_file(path).unwrap();
     }
 
     fn selection_view() -> DocumentView {

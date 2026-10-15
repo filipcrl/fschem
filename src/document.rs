@@ -306,6 +306,23 @@ impl Document {
         }
         result.map_err(|error| format!("{}: {error}", path.display()))
     }
+    /// Append a library instance using its template and a fresh instance name.
+    pub fn with_instance(&self, reference: &str, template: &str) -> Result<(Self, usize), String> {
+        let properties = Properties::parse(template.to_owned());
+        let prefix = properties.get("name").unwrap_or("X").trim_end_matches(|c: char| c.is_ascii_digit());
+        let prefix = if prefix.is_empty() { "X" } else { prefix };
+        let names: BTreeSet<_> = self.records.iter().filter_map(|r| match &r.kind {
+            RecordKind::Instance { properties, .. } => properties.get("name").map(str::to_ascii_lowercase),
+            _ => None,
+        }).collect();
+        let name = (1..).map(|n| format!("{prefix}{n}")).find(|n| !names.contains(&n.to_ascii_lowercase())).unwrap();
+        let properties = Properties::serialize_entries(std::iter::once(("name", Some(name.as_str()))).chain(
+            properties.entries.iter().filter(|(k, _)| k != "name").map(|(k, v)| (k.as_str(), v.as_deref()))));
+        let escape = |s: &str| s.replace('\\', "\\\\").replace('{', "\\{").replace('}', "\\}");
+        let index = self.records.len();
+        Ok((self.with_appended_text(&format!("C {{{}}} 0 0 0 0 {{{}}}{}", escape(reference), escape(&properties), self.newline()))?, index))
+    }
+
     /// Duplicate editable records in this document, assigning fresh instance names.
     /// Embedded definitions remain available to their copied symbol references.
     pub fn with_copied_records(
