@@ -474,6 +474,28 @@ impl Document {
         source.push_str(&self.source[cursor..self.scope.end]);
         Self::parse(source).map_err(|e| e.to_string())
     }
+    /// Append one symbol drawing primitive without rewriting existing records.
+    pub fn with_symbol_primitive(&self, source: &str) -> Result<(Self, usize), String> {
+        let primitive = Self::parse(source).map_err(|error| error.to_string())?;
+        if primitive.records.len() != 1 || !primitive.diagnostics.is_empty()
+            || !matches!(primitive.records[0].kind,
+                RecordKind::Line { .. } | RecordKind::Rectangle { .. }
+                | RecordKind::Arc { .. } | RecordKind::Polygon { .. } | RecordKind::Text { .. }) {
+            return Err("Expected one symbol drawing primitive".into());
+        }
+        if let RecordKind::Rectangle { layer: 5, properties, .. } = &primitive.records[0].kind {
+            if let Some(name) = properties.get("name") {
+                if self.records.iter().any(|record| matches!(&record.kind,
+                    RecordKind::Rectangle { layer: 5, properties, .. } if properties.get("name") == Some(name))) {
+                    return Err(format!("A pin named {name} already exists; choose a unique pin name"));
+                }
+            }
+        }
+        let index = self.records.len();
+        let text = source.replace("\r\n", "\n").replace('\n', self.newline());
+        Ok((self.with_appended_text(&text)?, index))
+    }
+
     pub fn with_wire(&self, a: Point, b: Point) -> Result<Self, String> {
         self.with_wire_unmerged(a, b)?.normalize_wires()
     }

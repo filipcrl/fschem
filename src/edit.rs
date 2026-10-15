@@ -37,6 +37,7 @@ impl Placement {
 
 pub enum EditOperation {
     Insert(EditState),
+    InsertPrimitive(EditState),
     Move(Placement),
     Copy(Placement),
     Delete,
@@ -72,6 +73,7 @@ impl EditCommand for DocumentCommand {
     fn label(&self) -> &'static str {
         match self.operation {
             EditOperation::Insert(_) => "Place instance",
+            EditOperation::InsertPrimitive(_) => "Place symbol primitive",
             EditOperation::SetGraphConfiguration { .. } => "Edit graph",
             EditOperation::Move(_) => "Move",
             EditOperation::Copy(_) => "Copy",
@@ -85,7 +87,7 @@ impl EditCommand for DocumentCommand {
         if self.after.is_none() {
             let mut state = self.before.clone();
             match self.operation {
-                EditOperation::Insert(ref after) => state = after.clone(),
+                EditOperation::Insert(ref after) | EditOperation::InsertPrimitive(ref after) => state = after.clone(),
                 EditOperation::SetGraphConfiguration { ref records, ref properties } => {
                     for (key, value) in properties {
                         state.document = Arc::new(state.document.with_record_property(records, key, value)?);

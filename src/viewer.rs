@@ -23,6 +23,8 @@ use std::{
 #[path = "instance_picker.rs"]
 mod instance_picker;
 use instance_picker::InstancePicker;
+#[path = "symbol_tools.rs"]
+mod symbol_tools;
 
 const DEMO: &str = include_str!("../examples/demo.sch");
 
@@ -98,6 +100,7 @@ struct DocumentView {
     target: Option<DocumentTarget>,
     moving: Option<MoveState>,
     wiring: Option<WireState>,
+    symbol_tools: symbol_tools::SymbolTools,
     history: CommandHistory,
     graphs: crate::schematic_graphs::SchematicGraphs,
 }
@@ -155,6 +158,7 @@ impl DocumentView {
             target,
             moving: None,
             wiring: None,
+            symbol_tools: Default::default(),
             history: CommandHistory::default(),
             graphs: Default::default(),
         }
@@ -330,6 +334,30 @@ impl DocumentView {
         }
         self.cache = PaintCache::new(&loaded.scene);
         self.loaded = Arc::new(loaded);
+        Ok(())
+    }
+    fn is_symbol(&self) -> bool {
+        match &self.target {
+            Some(DocumentTarget::File(path)) => path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("sym")),
+            Some(DocumentTarget::Embedded { .. }) => true,
+            None => false,
+        }
+    }
+    fn begin_symbol_primitive(&mut self, source: &str, paths: &LibraryPaths) -> Result<(), String> {
+        if !self.is_symbol() || self.moving.is_some() || self.wiring.is_some() {
+            return Err("Symbol drawing tools require an idle symbol document".into());
+        }
+        let (document, index) = self.loaded.document.with_symbol_primitive(source)?;
+        let restore = self.loaded.clone();
+        let selection_before = self.selected.clone();
+        self.install_document(document, paths)?;
+        self.select_records(&BTreeSet::from([index]));
+        self.begin_move(Point::default());
+        if let Some(moving) = &mut self.moving {
+            moving.restore = restore;
+            moving.selection_before = selection_before;
+            moving.inserting = true;
+        }
         Ok(())
     }
     fn begin_instance(&mut self, path: &Path, paths: &LibraryPaths) -> Result<(), String> {
@@ -582,7 +610,11 @@ impl DocumentView {
             flip: moving.flip,
         };
         let operation = if moving.inserting {
-            EditOperation::Insert(self.edit_state())
+            if moving.records.iter().any(|&index| matches!(moving.original.document.records[index].kind, RecordKind::Instance { .. })) {
+                EditOperation::Insert(self.edit_state())
+            } else {
+                EditOperation::InsertPrimitive(self.edit_state())
+            }
         } else if moving.copying {
             EditOperation::Copy(placement)
         } else {
@@ -2239,6 +2271,16 @@ impl Viewer {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.heading("Document");
                 if let Some(current) = &mut self.current {
+                    if current.is_symbol() {
+                        let idle = current.moving.is_none() && current.wiring.is_none() && self.loading.is_none();
+                        let primitive = ui.add_enabled_ui(idle, |ui| current.symbol_tools.show(ui)).inner;
+                        if let Some(source) = primitive {
+                            if let Err(error) = current.begin_symbol_primitive(&source, &self.paths) {
+                                self.error = Some(error);
+                            }
+                        }
+                        ui.separator();
+                    }
                     let loaded = &current.loaded;
                     ui.label(current.target.as_ref().map(DocumentTarget::description).unwrap_or_else(|| "Built-in demo (embedded symbols)".into()));
                     ui.weak(format!("File format {} · {} bytes", loaded.document.version(), loaded.document.original().len()));
@@ -3072,6 +3114,48 @@ mod tests {
         view.redo(&paths).unwrap();
         assert_eq!(view.loaded.document.original(), placed);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn symbol_tools_place_cancel_and_undo_all_primitive_types() {
+        let paths = LibraryPaths::default();
+        let loaded = Arc::new(LoadedDocument::from_document(
+            Arc::new(Document::parse("v {xschem file_version=1.2}\nK {type=subcircuit}\n").unwrap()),
+            None, paths.clone(),
+        ).unwrap());
+        let mut view = DocumentView::new(loaded.clone(), PaintCache::new(&loaded.scene));
+        assert!(!view.is_symbol());
+        assert!(view.begin_symbol_primitive("L 4 0 0 40 0 {}\n", &paths).is_err());
+        view.target = Some(DocumentTarget::File(PathBuf::from("test.sym")));
+        assert!(view.is_symbol());
+        for primitive in [
+            "L 4 0 0 40 0 {}\n", "B 4 0 0 40 40 {}\n",
+            "A 4 0 0 20 0 360 {}\n", "T {@name} 0 0 0 0 0.3 0.3 {layer=4}\n",
+            "B 5 -2.5 -2.5 2.5 2.5 {name=P1 dir=inout}\n",
+        ] {
+            let before = view.loaded.document.original().to_owned();
+            view.begin_symbol_primitive(primitive, &paths).unwrap();
+            assert!(view.moving.is_some());
+            view.cancel_move();
+            assert_eq!(view.loaded.document.original(), before);
+            view.begin_symbol_primitive(primitive, &paths).unwrap();
+            view.update_move(Some(Point::new(40., 60.)), &[Key::R], 10., &paths).unwrap();
+            view.commit_move(&paths).unwrap();
+            assert_eq!(view.history.undo_label(), Some("Place symbol primitive"));
+            let placed = view.loaded.document.original().to_owned();
+            assert_ne!(placed, before);
+            view.undo(&paths).unwrap();
+            assert_eq!(view.loaded.document.original(), before);
+            view.redo(&paths).unwrap();
+            assert_eq!(view.loaded.document.original(), placed);
+        }
+        assert!(view.begin_symbol_primitive("B 5 0 0 5 5 {name=P1 dir=in}\n", &paths).is_err());
+        view.target = Some(DocumentTarget::Embedded {
+            document: view.loaded.document.clone(), source: PathBuf::from("parent.sch"), symbol: "cell.sym".into(),
+        });
+        assert!(view.is_symbol());
+        view.target = Some(DocumentTarget::File(PathBuf::from("test.sch")));
+        assert!(!view.is_symbol());
     }
 
     fn selection_view() -> DocumentView {

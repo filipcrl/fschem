@@ -339,6 +339,13 @@ unconnected, and labels are preserved when splitting. Escape
 keeps already placed wire segments. The Edit menu displays available actions
 and their shortcuts; rotation and mirroring require a move/copy in progress.
 
+When editing a `.sym` file or an embedded symbol, the inspector shows a **Symbol
+tools** panel. Create lines, rectangles, circles, text, and pins; choose drawing
+layers, dimensions, text scale, and pin name/direction before placement. Click the
+canvas to place, use R/X/Y to rotate or mirror, or Esc to cancel. Pin names must be
+unique. Existing selection, move, copy, delete, save, and undo/redo tools work on
+the new primitives. These creation controls are hidden in schematic documents.
+
 Each committed placement (including its rotations and mirrors), deletion, or
 wire-placement click is one undoable command. A wire click that inserts a bend
 is still one command. Selection and document text are restored together. Undo
