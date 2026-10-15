@@ -41,6 +41,7 @@ pub enum EditOperation {
     Copy(Placement),
     Delete,
     Wire { start: Point, end: Point },
+    WireRoute { start: Point, bend: Point, end: Point },
     SetInstanceProperty { key: String, value: String },
     SetRecordProperty { key: String, value: String },
     SetGraphConfiguration { records: BTreeSet<usize>, properties: std::collections::BTreeMap<String, String> },
@@ -75,7 +76,7 @@ impl EditCommand for DocumentCommand {
             EditOperation::Move(_) => "Move",
             EditOperation::Copy(_) => "Copy",
             EditOperation::Delete => "Delete",
-            EditOperation::Wire { .. } => "Add wire",
+            EditOperation::Wire { .. } | EditOperation::WireRoute { .. } => "Add wire",
             EditOperation::SetInstanceProperty { .. }
             | EditOperation::SetRecordProperty { .. } => "Edit property",
         }
@@ -103,6 +104,13 @@ impl EditCommand for DocumentCommand {
                 EditOperation::Delete => {
                     state.document = Arc::new(state.document.without_records(&state.selection)?);
                     state.selection.clear();
+                }
+                EditOperation::WireRoute { start, bend, end } => {
+                    for (a, b) in [(start, bend), (bend, end)] {
+                        if a != b {
+                            state.document = Arc::new(state.document.with_wire(a, b)?);
+                        }
+                    }
                 }
                 EditOperation::Wire { start, end } => {
                     state.document = Arc::new(state.document.with_wire(start, end)?);

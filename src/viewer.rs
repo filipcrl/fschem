@@ -119,6 +119,16 @@ struct WireState {
     start: Point,
     end: Point,
     on_connection: bool,
+    horizontal_first: bool,
+}
+impl WireState {
+    fn bend(&self) -> Point {
+        if self.horizontal_first {
+            Point::new(self.end.x, self.start.y)
+        } else {
+            Point::new(self.start.x, self.end.y)
+        }
+    }
 }
 impl DocumentView {
     fn new(loaded: Arc<LoadedDocument>, cache: PaintCache) -> Self {
@@ -456,6 +466,7 @@ impl DocumentView {
             start,
             end: start,
             on_connection,
+            horizontal_first: true,
         });
         self.selection_box = None;
     }
@@ -471,8 +482,10 @@ impl DocumentView {
             return Ok(());
         };
         let (start, end, on_connection) = (wiring.start, wiring.end, wiring.on_connection);
+        let bend = wiring.bend();
+        let horizontal_first = wiring.horizontal_first;
         if start != end {
-            self.execute_command(EditOperation::Wire { start, end }, self.edit_state(), paths)?;
+            self.execute_command(EditOperation::WireRoute { start, bend, end }, self.edit_state(), paths)?;
         }
         self.wiring = if on_connection {
             None
@@ -481,6 +494,7 @@ impl DocumentView {
                 start: end,
                 end,
                 on_connection: false,
+                horizontal_first,
             })
         };
         Ok(())
@@ -1323,7 +1337,8 @@ impl Viewer {
         match key {
             Key::G | Key::C | Key::Backspace => idle && !view.selected.is_empty(),
             Key::W => idle,
-            Key::R | Key::X | Key::Y => view.moving.is_some(),
+            Key::R => view.moving.is_some() || view.wiring.is_some(),
+            Key::X | Key::Y => view.moving.is_some(),
             Key::Escape => !idle,
             _ => false,
         }
@@ -1410,6 +1425,11 @@ impl Viewer {
                 Key::Backspace => current.delete_selection(&self.paths),
                 Key::W => {
                     current.begin_wire(pointer, self.grid_spacing);
+                    Ok(())
+                }
+                Key::R if current.wiring.is_some() => {
+                    let wiring = current.wiring.as_mut().unwrap();
+                    wiring.horizontal_first = !wiring.horizontal_first;
                     Ok(())
                 }
                 Key::R | Key::X | Key::Y => {
@@ -2449,6 +2469,10 @@ impl Viewer {
                             Err(error) => self.error = Some(error),
                         }
                     } else if was_wiring && let Some(pointer) = self.pointer {
+                        if keys.contains(&Key::R) {
+                            let wiring = current.wiring.as_mut().unwrap();
+                            wiring.horizontal_first = !wiring.horizontal_first;
+                        }
                         current.update_wire(pointer, self.grid_spacing);
                         if response.clicked_by(PointerButton::Primary)
                             && let Err(error) = current.place_wire(&self.paths) { self.error = Some(error); }
@@ -2477,7 +2501,13 @@ impl Viewer {
                     );
                     current.graphs.paint(ui, &canvas, &current.loaded, &current.layers);
                     if let Some(wiring) = &current.wiring {
-                        canvas.wire_preview(wiring.start, wiring.end, wiring.on_connection);
+                        let bend = wiring.bend();
+                        if wiring.start != bend {
+                            canvas.wire_preview(wiring.start, bend, wiring.on_connection && bend == wiring.end);
+                        }
+                        if bend != wiring.end {
+                            canvas.wire_preview(bend, wiring.end, wiring.on_connection);
+                        }
                     }
                     if let Some(start) = current.selection_box
                         && let Some(end) = ui.input(|input| input.pointer.interact_pos()) {
@@ -3590,6 +3620,8 @@ mod tests {
         click(&mut viewer, &ctx, center + egui::vec2(40., 60.));
         assert!(viewer.current.as_ref().unwrap().wiring.is_some());
         let selection = viewer.current.as_ref().unwrap().selected.clone();
+        key(&mut viewer, &ctx, Key::R);
+        assert!(!viewer.current.as_ref().unwrap().wiring.as_ref().unwrap().horizontal_first);
         click(&mut viewer, &ctx, center + egui::vec2(189., 94.));
         let view = viewer.current.as_ref().unwrap();
         assert!(view.wiring.is_none());
@@ -3612,8 +3644,8 @@ mod tests {
             vec![
                 (Point::default(), Point::new(40., 0.)),
                 (Point::new(40., 0.), Point::new(40., 60.)),
-                (Point::new(40., 60.), Point::new(73., 93.)),
-                (Point::new(73., 93.), Point::new(187., 93.))
+                (Point::new(40., 60.), Point::new(40., 93.)),
+                (Point::new(40., 93.), Point::new(187., 93.))
             ]
         );
         key(&mut viewer, &ctx, Key::W); // Begin another wire on the port.

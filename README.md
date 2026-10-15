@@ -328,8 +328,9 @@ Other platforms use the in-window menu bar.
 | Up button | Same stack pop as Shift-E |
 
 Moves and copies snap their displacement to the grid. Rotation/mirroring uses
-the point grabbed by the cursor as its pivot. New wire routes use horizontal,
-vertical, and 45° diagonal segments, inserting a bend when necessary. Escape
+the point grabbed by the cursor as its pivot. New wire routes use only horizontal
+and vertical segments, inserting a right-angle bend when necessary. Press **R**
+while wiring to toggle horizontal-first versus vertical-first routing. Escape
 keeps already placed wire segments. The Edit menu displays available actions
 and their shortcuts; rotation and mirroring require a move/copy in progress.
 
