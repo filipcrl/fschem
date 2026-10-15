@@ -108,12 +108,12 @@ impl EditCommand for DocumentCommand {
                 EditOperation::WireRoute { start, bend, end } => {
                     for (a, b) in [(start, bend), (bend, end)] {
                         if a != b {
-                            state.document = Arc::new(state.document.with_wire(a, b)?);
+                            state.document = Arc::new(state.document.with_wire_unmerged(a, b)?);
                         }
                     }
                 }
                 EditOperation::Wire { start, end } => {
-                    state.document = Arc::new(state.document.with_wire(start, end)?);
+                    state.document = Arc::new(state.document.with_wire_unmerged(start, end)?);
                 }
                 EditOperation::SetRecordProperty { ref key, ref value } => {
                     state.document = Arc::new(state.document.with_record_property(
@@ -129,6 +129,11 @@ impl EditCommand for DocumentCommand {
                         value,
                     )?);
                 }
+            }
+            if state.document.original() != self.before.document.original() {
+                let (document, selection) = state.document.normalize_wires_with_selection(&state.selection)?;
+                state.document = Arc::new(document);
+                state.selection = selection;
             }
             self.after = Some(state);
         }
@@ -217,6 +222,30 @@ mod tests {
     }
 
     #[test]
+    fn moving_and_deleting_branches_rechecks_both_old_and_new_junctions() {
+        let mut state = EditState {
+            document: Arc::new(Document::parse("N 0 0 40 0 {}\nN 40 0 80 0 {}\nN 40 0 40 30 {}\nN 0 100 80 100 {}\n").unwrap()),
+            selection: BTreeSet::from([2]),
+        };
+        let original = state.clone();
+        let mut history = CommandHistory::default();
+        execute(&mut history, &mut state, EditOperation::Move(Placement {
+            at: Point::new(0., 100.), ..identity()
+        }));
+        assert_eq!(state.document.original(), "N 0 0 80 0 {}\nN 40 100 40 130 {}\nN 0 100 40 100 {}\nN 40 100 80 100 {}\n");
+        assert_eq!(state.selection, BTreeSet::from([1]));
+        let moved = state.clone();
+        history.undo(|next| { state = next.clone(); Ok(()) }).unwrap();
+        assert_eq!(state.document.original(), original.document.original());
+        assert_eq!(state.selection, original.selection);
+        history.redo(|next| { state = next.clone(); Ok(()) }).unwrap();
+        assert_eq!(state.document.original(), moved.document.original());
+        assert_eq!(state.selection, moved.selection);
+        execute(&mut history, &mut state, EditOperation::Delete);
+        assert_eq!(state.document.original(), "N 0 0 80 0 {}\nN 0 100 80 100 {}\n");
+    }
+
+    #[test]
     fn commands_restore_exact_documents_selections_and_copy_names() {
         let mut state = state();
         let original = state.clone();
@@ -234,7 +263,7 @@ mod tests {
         let moved = state.clone();
         execute(&mut history, &mut state, EditOperation::Copy(identity()));
         let copied = state.clone();
-        assert_eq!(state.selection, BTreeSet::from([4, 5]));
+        assert_eq!(state.selection, BTreeSet::from([3, 4])); // duplicate wire merges; copied instance shifts
         assert!(state.document.original().contains("name=\"X2\""));
         execute(&mut history, &mut state, EditOperation::Delete);
         assert!(state.selection.is_empty());

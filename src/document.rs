@@ -475,6 +475,9 @@ impl Document {
         Self::parse(source).map_err(|e| e.to_string())
     }
     pub fn with_wire(&self, a: Point, b: Point) -> Result<Self, String> {
+        self.with_wire_unmerged(a, b)?.normalize_wires()
+    }
+    pub(crate) fn with_wire_unmerged(&self, a: Point, b: Point) -> Result<Self, String> {
         if [a.x, a.y, b.x, b.y]
             .iter()
             .any(|v| !v.is_finite() || v.abs() > 1e100)
@@ -491,14 +494,18 @@ impl Document {
                 format!("N {} {} {} {} {{}}{}", a.x, a.y, b.x, b.y, self.newline())
             })
             .collect::<String>();
-        self.with_appended_text(&text)?.normalize_wires()
+        self.with_appended_text(&text)
     }
 
     /// Merge compatible axis-aligned wires, then split at endpoint junctions.
     /// Interior/interior crossings intentionally do not create connections.
     fn normalize_wires(&self) -> Result<Self, String> {
+        self.normalize_wires_with_selection(&BTreeSet::new()).map(|(document, _)| document)
+    }
+
+    pub fn normalize_wires_with_selection(&self, selection: &BTreeSet<usize>) -> Result<(Self, BTreeSet<usize>), String> {
         #[derive(Clone)]
-        struct Wire { owner: usize, a: Point, b: Point, properties: String }
+        struct Wire { owner: usize, a: Point, b: Point, properties: String, selected: bool }
         fn horizontal(w: &Wire) -> bool { w.a.y == w.b.y }
         fn vertical(w: &Wire) -> bool { w.a.x == w.b.x }
         fn contains(w: &Wire, p: Point) -> bool {
@@ -510,7 +517,7 @@ impl Document {
         }
         let mut wires: Vec<Wire> = self.records.iter().enumerate().filter_map(|(owner, record)| {
             if let RecordKind::Wire { a, b, properties } = &record.kind {
-                Some(Wire { owner, a: *a, b: *b, properties: properties.raw.clone() })
+                Some(Wire { owner, a: *a, b: *b, properties: properties.raw.clone(), selected: selection.contains(&owner) })
             } else { None }
         }).collect();
         // Preserve established junctions even when both arms of a cross merge.
@@ -537,6 +544,7 @@ impl Document {
                     let mut points = [a.a, a.b, b.a, b.b];
                     let h = horizontal(a);
                     points.sort_by(|a, b| if h { a.x.total_cmp(&b.x) } else { a.y.total_cmp(&b.y) });
+                    wires[i].selected |= wires[j].selected;
                     wires[i].a = points[0];
                     wires[i].b = points[3];
                     wires.remove(j);
@@ -553,7 +561,13 @@ impl Document {
                 replacements.insert(index, String::new());
             }
         }
+        let mut selected_owners = selection.clone();
         for wire in &wires {
+            if wire.selected { selected_owners.insert(wire.owner); }
+            if wire.a == wire.b {
+                replacements.insert(wire.owner, self.raw_record(&self.records[wire.owner]).to_owned());
+                continue;
+            }
             let mut points = vec![wire.a, wire.b];
             points.extend(endpoints.iter().copied().filter(|&p| contains(wire, p)));
             if horizontal(wire) {
@@ -576,14 +590,20 @@ impl Document {
         }
         let mut source = String::new();
         let mut cursor = self.scope.start;
-        for (index, replacement) in replacements {
-            let record = &self.records[index];
+        let mut selected_spans = Vec::new();
+        for (index, record) in self.records.iter().enumerate() {
             source.push_str(&self.source[cursor..record.span.start]);
-            source.push_str(&replacement);
+            let start = source.len();
+            source.push_str(replacements.get(&index).map(String::as_str).unwrap_or_else(|| self.raw_record(record)));
+            if selected_owners.contains(&index) { selected_spans.push(start..source.len()); }
             cursor = record.span.end;
         }
         source.push_str(&self.source[cursor..self.scope.end]);
-        Self::parse(source).map_err(|error| error.to_string())
+        let document = Self::parse(source).map_err(|error| error.to_string())?;
+        let selected = document.records.iter().enumerate().filter_map(|(index, record)| {
+            selected_spans.iter().any(|span| span.contains(&record.span.start)).then_some(index)
+        }).collect();
+        Ok((document, selected))
     }
     fn newline(&self) -> &'static str {
         if self.original().contains("\r\n") {
