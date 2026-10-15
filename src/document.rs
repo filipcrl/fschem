@@ -491,7 +491,99 @@ impl Document {
                 format!("N {} {} {} {} {{}}{}", a.x, a.y, b.x, b.y, self.newline())
             })
             .collect::<String>();
-        self.with_appended_text(&text)
+        self.with_appended_text(&text)?.normalize_wires()
+    }
+
+    /// Merge compatible axis-aligned wires, then split at endpoint junctions.
+    /// Interior/interior crossings intentionally do not create connections.
+    fn normalize_wires(&self) -> Result<Self, String> {
+        #[derive(Clone)]
+        struct Wire { owner: usize, a: Point, b: Point, properties: String }
+        fn horizontal(w: &Wire) -> bool { w.a.y == w.b.y }
+        fn vertical(w: &Wire) -> bool { w.a.x == w.b.x }
+        fn contains(w: &Wire, p: Point) -> bool {
+            if horizontal(w) {
+                p.y == w.a.y && p.x >= w.a.x.min(w.b.x) && p.x <= w.a.x.max(w.b.x)
+            } else if vertical(w) {
+                p.x == w.a.x && p.y >= w.a.y.min(w.b.y) && p.y <= w.a.y.max(w.b.y)
+            } else { false }
+        }
+        let mut wires: Vec<Wire> = self.records.iter().enumerate().filter_map(|(owner, record)| {
+            if let RecordKind::Wire { a, b, properties } = &record.kind {
+                Some(Wire { owner, a: *a, b: *b, properties: properties.raw.clone() })
+            } else { None }
+        }).collect();
+        // Preserve established junctions even when both arms of a cross merge.
+        let junctions: Vec<Point> = wires.iter().flat_map(|wire| {
+            [wire.a, wire.b].into_iter().filter(|&p| wires.iter().any(|other| {
+                other.owner != wire.owner
+                    && (contains(other, p) || other.a == p || other.b == p)
+                    && ((wire.b.x - wire.a.x) * (other.b.y - other.a.y)
+                        != (wire.b.y - wire.a.y) * (other.b.x - other.a.x))
+            }))
+        }).collect();
+        // Repeat because a newly extended wire can bridge earlier disjoint pieces.
+        loop {
+            let mut merged = false;
+            'pairs: for i in 0..wires.len() {
+                for j in i + 1..wires.len() {
+                    let (a, b) = (&wires[i], &wires[j]);
+                    let collinear = (horizontal(a) && horizontal(b) && a.a.y == b.a.y)
+                        || (vertical(a) && vertical(b) && a.a.x == b.a.x);
+                    if a.properties != b.properties || !collinear
+                        || !(contains(a, b.a) || contains(a, b.b) || contains(b, a.a) || contains(b, a.b)) {
+                        continue;
+                    }
+                    let mut points = [a.a, a.b, b.a, b.b];
+                    let h = horizontal(a);
+                    points.sort_by(|a, b| if h { a.x.total_cmp(&b.x) } else { a.y.total_cmp(&b.y) });
+                    wires[i].a = points[0];
+                    wires[i].b = points[3];
+                    wires.remove(j);
+                    merged = true;
+                    break 'pairs;
+                }
+            }
+            if !merged { break; }
+        }
+        let endpoints: Vec<Point> = wires.iter().flat_map(|w| [w.a, w.b]).chain(junctions).collect();
+        let mut replacements = BTreeMap::new();
+        for (index, record) in self.records.iter().enumerate() {
+            if matches!(record.kind, RecordKind::Wire { .. }) {
+                replacements.insert(index, String::new());
+            }
+        }
+        for wire in &wires {
+            let mut points = vec![wire.a, wire.b];
+            points.extend(endpoints.iter().copied().filter(|&p| contains(wire, p)));
+            if horizontal(wire) {
+                points.sort_by(|a, b| a.x.total_cmp(&b.x));
+            } else if vertical(wire) {
+                points.sort_by(|a, b| a.y.total_cmp(&b.y));
+            }
+            points.dedup();
+            let record = &self.records[wire.owner];
+            let unchanged = if let RecordKind::Wire { a, b, .. } = &record.kind {
+                points.len() == 2 && ((points[0] == *a && points[1] == *b) || (points[0] == *b && points[1] == *a))
+            } else { false };
+            let text = if unchanged {
+                self.raw_record(record).to_owned()
+            } else {
+                points.windows(2).map(|p| format!("N {} {} {} {} {{{}}}{}",
+                    p[0].x, p[0].y, p[1].x, p[1].y, wire.properties, self.newline())).collect()
+            };
+            replacements.insert(wire.owner, text);
+        }
+        let mut source = String::new();
+        let mut cursor = self.scope.start;
+        for (index, replacement) in replacements {
+            let record = &self.records[index];
+            source.push_str(&self.source[cursor..record.span.start]);
+            source.push_str(&replacement);
+            cursor = record.span.end;
+        }
+        source.push_str(&self.source[cursor..self.scope.end]);
+        Self::parse(source).map_err(|error| error.to_string())
     }
     fn newline(&self) -> &'static str {
         if self.original().contains("\r\n") {
@@ -1088,6 +1180,37 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wire_normalization_merges_and_splits_without_connecting_crossings() {
+        fn wires(doc: &super::Document) -> Vec<(super::Point, super::Point)> {
+            doc.records.iter().filter_map(|r| match r.kind {
+                super::RecordKind::Wire { a, b, .. } => Some((a, b)), _ => None,
+            }).collect()
+        }
+        let p = super::Point::new;
+        let source = "v {xschem file_version=1.2}\n# retain this comment\nN 0 0 40 0 {}\n";
+        let doc = super::Document::parse(source).unwrap();
+        let extended = doc.with_wire(p(80., 0.), p(40., 0.)).unwrap();
+        assert_eq!(wires(&extended), vec![(p(0., 0.), p(80., 0.))]);
+        assert!(extended.original().contains("# retain this comment\n"));
+        let duplicate = extended.with_wire(p(20., 0.), p(60., 0.)).unwrap();
+        assert_eq!(wires(&duplicate), wires(&extended));
+        let branched = extended.with_wire(p(40., 0.), p(40., 30.)).unwrap();
+        assert_eq!(wires(&branched), vec![(p(0., 0.), p(40., 0.)), (p(40., 0.), p(80., 0.)), (p(40., 0.), p(40., 30.))]);
+        let cross = branched.with_wire(p(40., -30.), p(40., 0.)).unwrap();
+        assert_eq!(wires(&cross).len(), 4, "connected cross stays split");
+        assert_eq!(cross.normalize_wires().unwrap().original(), cross.original());
+        let crossing = extended.with_wire(p(40., -30.), p(40., 30.)).unwrap();
+        assert_eq!(wires(&crossing).len(), 2, "interior crossing stays unconnected");
+        let labeled = super::Document::parse("N 0 0 40 0 {lab=A}\nN 40 0 80 0 {lab=B}\n").unwrap();
+        assert_eq!(labeled.normalize_wires().unwrap().original(), labeled.original());
+        let split = labeled.with_wire(p(20., 0.), p(20., 30.)).unwrap();
+        assert_eq!(split.original().matches("{lab=A}").count(), 2);
+        let bridge = super::Document::parse("N 0 0 20 0 {}\nN 40 0 60 0 {}\n").unwrap()
+            .with_wire(p(20., 0.), p(40., 0.)).unwrap();
+        assert_eq!(wires(&bridge), vec![(p(0., 0.), p(60., 0.))]);
+    }
+
     use super::*;
     #[test]
     fn deleting_an_embedded_instance_preserves_the_definition_for_its_copies() {

@@ -3643,8 +3643,7 @@ mod tests {
             wires,
             vec![
                 (Point::default(), Point::new(40., 0.)),
-                (Point::new(40., 0.), Point::new(40., 60.)),
-                (Point::new(40., 60.), Point::new(40., 93.)),
+                (Point::new(40., 0.), Point::new(40., 93.)),
                 (Point::new(40., 93.), Point::new(187., 93.))
             ]
         );

@@ -330,7 +330,10 @@ Other platforms use the in-window menu bar.
 Moves and copies snap their displacement to the grid. Rotation/mirroring uses
 the point grabbed by the cursor as its pivot. New wire routes use only horizontal
 and vertical segments, inserting a right-angle bend when necessary. Press **R**
-while wiring to toggle horizontal-first versus vertical-first routing. Escape
+while wiring to toggle horizontal-first versus vertical-first routing. Placing
+wires merges touching or overlapping collinear segments with identical properties
+and splits segments at branch connections. Unconnected interior crossings remain
+unconnected, and labels are preserved when splitting. Escape
 keeps already placed wire segments. The Edit menu displays available actions
 and their shortcuts; rotation and mirroring require a move/copy in progress.
 
