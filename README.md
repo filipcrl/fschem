@@ -301,6 +301,7 @@ Other platforms use the in-window menu bar.
 
 | Control | Action |
 | --- | --- |
+| Ctrl/Command-N | Create a blank schematic (.sch) or symbol (.sym) in a new tab; existing files are never overwritten |
 | Ctrl/Command-O | Open a schematic or symbol in a new tab |
 | Ctrl/Command-W | Close the active tab |
 | Ctrl/Command-R | Reload the current file and its symbol dependencies |

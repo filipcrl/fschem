@@ -11,6 +11,7 @@ pub enum Command {
     Undo,
     Redo,
     Edit(egui::Key),
+    New,
     Open,
     OpenText,
     Save,
@@ -50,6 +51,7 @@ define_class!(
         #[unsafe(method(performMenuCommand:))]
         fn perform_command(&self, sender: &NSMenuItem) {
             let command = match sender.tag() {
+                41 => Command::New,
                 0 => Command::Open,
                 40 => Command::OpenText,
                 1 => Command::Demo,
@@ -129,6 +131,7 @@ impl NativeMenu {
             (
                 "File",
                 vec![
+                    ("New…", "n", 41),
                     ("Open…", "o", 0),
                     ("Open as text…", "", 40),
                     ("Save", "s", 13),

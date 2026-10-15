@@ -25,6 +25,21 @@ mod instance_picker;
 use instance_picker::InstancePicker;
 
 const DEMO: &str = include_str!("../examples/demo.sch");
+
+fn create_document(path: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let kind = match path.extension().and_then(|ext| ext.to_str()) {
+        Some("sch") => "",
+        Some("sym") => "type=subcircuit",
+        _ => return Err("New files must use a .sch or .sym extension".into()),
+    };
+    let source = format!("v {{xschem version=3.4.6 file_version=1.2}}\nG {{}}\nK {{{kind}}}\nV {{}}\nS {{}}\nE {{}}\n");
+    // Never truncate an existing file, even if the dialog permits replacement.
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true)
+        .open(path).map_err(|error| format!("Cannot create {}: {error}", path.display()))?;
+    file.write_all(source.as_bytes())
+        .map_err(|error| format!("Cannot write {}: {error}", path.display()))
+}
 const DEFAULT_GRID_SPACING: f64 = 10.;
 const MIN_GRID_SPACING: f64 = 0.001;
 const MAX_GRID_SPACING: f64 = 1e6;
@@ -921,6 +936,7 @@ enum Action {
     Open(PathBuf),
     Save,
     SaveAs,
+    New,
     OpenDialog,
     OpenTextDialog,
     OpenText(PathBuf),
@@ -1342,7 +1358,7 @@ impl Viewer {
                 self.text.as_mut().unwrap().reload(ctx);
                 return;
             }
-            if !matches!(action, Action::OpenRun(_) | Action::OpenRunDialog | Action::Open(_) | Action::OpenText(_) | Action::OpenTextDialog | Action::OpenDialog | Action::CloseTab | Action::Demo | Action::OpenRaw) {
+            if !matches!(action, Action::New | Action::OpenRun(_) | Action::OpenRunDialog | Action::Open(_) | Action::OpenText(_) | Action::OpenTextDialog | Action::OpenDialog | Action::CloseTab | Action::Demo | Action::OpenRaw) {
                 return;
             }
         }
@@ -1528,6 +1544,21 @@ impl Viewer {
                     self.action(ctx, Action::Open(path));
                 }
             }
+            Action::New => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Create schematic or symbol")
+                    .set_file_name("untitled.sch")
+                    .add_filter("Xschem schematic", &["sch"])
+                    .add_filter("Xschem symbol", &["sym"])
+                    .save_file()
+                {
+                    let path = if path.extension().is_none() { path.with_extension("sch") } else { path };
+                    match create_document(&path) {
+                        Ok(()) => self.open_tab(ctx, Some(path)),
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+            }
             Action::Demo => self.open_tab(ctx, None),
             Action::ExportSpice | Action::Simulate => {
                 let simulate = matches!(action, Action::Simulate);
@@ -1710,6 +1741,7 @@ impl Viewer {
             use crate::macos_menu::Command;
             for command in menu.commands() {
                 match command {
+                    Command::New => actions.push(Action::New),
                     Command::Open => actions.push(Action::OpenDialog),
                     Command::OpenText => actions.push(Action::OpenTextDialog),
                     Command::CloseTab => actions.push(Action::CloseTab),
@@ -1779,6 +1811,12 @@ impl Viewer {
             }
             if input.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,
+                Key::N,
+            )) {
+                actions.push(Action::New);
+            }
+            if input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
                 Key::O,
             )) {
                 actions.push(Action::OpenDialog);
@@ -1841,6 +1879,10 @@ impl Viewer {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open run…").clicked() { actions.push(Action::OpenRunDialog); }
                     if ui.button("Open as text…").clicked() { actions.push(Action::OpenTextDialog); ui.close(); }
+                    if ui.button("New…     Ctrl/Command-N").clicked() {
+                        actions.push(Action::New);
+                        ui.close();
+                    }
                     if ui.button("Open…     Ctrl/Command-O").clicked() {
                         actions.push(Action::OpenDialog);
                         ui.close();
@@ -2011,6 +2053,9 @@ impl Viewer {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Open run…").clicked() { actions.push(Action::OpenRunDialog); }
                     if ui.button("Open as text…").clicked() { actions.push(Action::OpenTextDialog); }
+                if ui.button("New…").clicked() {
+                    actions.push(Action::New);
+                }
                 if ui.button("Open…").clicked() {
                     actions.push(Action::OpenDialog);
                 }
@@ -2468,6 +2513,9 @@ impl Viewer {
                             "Open existing Xschem schematics and symbols without modifying them.",
                         );
                         ui.add_space(18.);
+                        if ui.button("New schematic or symbol…").clicked() {
+                            actions.push(Action::New);
+                        }
                         if ui.button("Open schematic or symbol…").clicked() {
                             actions.push(Action::OpenDialog);
                         }
@@ -2780,6 +2828,24 @@ fn property_editor_rows(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_documents_are_valid_and_never_overwrite_files() {
+        let dir = std::env::temp_dir().join(format!("fschem-new-{}-{}", std::process::id(), super::session_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for extension in ["sch", "sym"] {
+            let path = dir.join(format!("new.{extension}"));
+            super::create_document(&path).unwrap();
+            let source = std::fs::read_to_string(&path).unwrap();
+            let document = fschem::document::Document::parse(source.as_str()).unwrap();
+            assert!(document.diagnostics.is_empty());
+            assert!(super::create_document(&path).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+        assert!(super::create_document(&dir.join("invalid.txt")).is_err());
+        assert!(!dir.join("invalid.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
     #[test]
     fn graph_properties_edit_source_round_trip_and_undo() {
