@@ -67,7 +67,8 @@ impl InstancePicker {
                 ui.label(format!("{} symbols · ↑/↓ select · Enter to place · Esc to cancel", matches.len()));
                 egui::ScrollArea::vertical().max_height(360.).show(ui, |ui| {
                     for (index, (_, path)) in matches.iter().enumerate() {
-                        let response = ui.selectable_label(index == self.selected, path.file_name().unwrap().to_string_lossy());
+                        let label = format!("{}\n{}", path.file_name().unwrap().to_string_lossy(), path.display());
+                        let response = ui.selectable_label(index == self.selected, label);
                         if index == self.selected && (down || up || search.changed()) { response.scroll_to_me(None); }
                         if response.clicked() { chosen = Some((*path).clone()); }
                         response.on_hover_text(path.display().to_string());

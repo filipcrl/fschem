@@ -548,6 +548,7 @@ impl DocumentView {
     fn cancel_move(&mut self) {
         if let Some(moving) = self.moving.take() {
             self.loaded = moving.restore;
+            self.layers.retain(|layer, _| self.loaded.scene.layers.contains_key(layer));
             self.selected = moving.selection_before;
             self.cache = PaintCache::new(&self.loaded.scene);
         }
@@ -2231,7 +2232,7 @@ impl Viewer {
                         for (&layer, visible) in &mut current.layers {
                             ui.horizontal(|ui| {
                                     ui.colored_label(layer_color(layer), "■");
-                                ui.checkbox(visible, format!("{layer}: {} ({})", layer_name(layer), loaded.scene.layers[&layer]));
+                                ui.checkbox(visible, format!("{layer}: {} ({})", layer_name(layer), loaded.scene.layers.get(&layer).copied().unwrap_or(0)));
                             });
                         }
                     });
@@ -3018,11 +3019,15 @@ mod tests {
     fn library_instance_placement_cancels_and_undoes() {
         let paths = LibraryPaths::default();
         let path = std::env::temp_dir().join(format!("fschem-picker-{}.sym", session_id()));
-        std::fs::write(&path, "v {xschem file_version=1.3}\nK {template=\"name=R1 value=1k\"}\nL 4 -10 0 10 0 {}\n").unwrap();
+        std::fs::write(&path, "v {xschem file_version=1.3}\nK {template=\"name=R1 value=1k\"}\nL 17 -10 0 10 0 {}\n").unwrap();
         let mut view = selection_view();
         let original = view.loaded.document.original().to_owned();
+        let original_layers = view.layers.clone();
         view.begin_instance(&path, &paths).unwrap();
+        assert!(view.layers.contains_key(&17));
         view.cancel_move();
+        assert!(view.moving.is_none());
+        assert_eq!(view.layers, original_layers);
         assert_eq!(view.loaded.document.original(), original);
         view.begin_instance(&path, &paths).unwrap();
         view.update_move(Some(Point::new(40., 60.)), &[], 10., &paths).unwrap();
